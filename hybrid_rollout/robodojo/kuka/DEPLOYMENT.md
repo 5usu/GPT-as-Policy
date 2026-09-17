@@ -82,9 +82,25 @@ from a different instant reviews nothing.
 | Jetson web UI | `:8080` | LAN `192.168.3.7`, Tailscale `100.110.61.50` |
 | A800 | proposals only | no route to the robot network |
 
-`rsi_response_xml()` in `transports.py` shows the exact `<Sen>` frame shape for
-cross-checking against `teleoperation/trigger_RSI/*.src`. Nothing in this package
-sends it.
+`rsi_gateway.py` implements the real gateway: it binds UDP, parses `<AIPos>` and
+`<IPOC>`, replies with the `<Sen Type="ImFree">` frame, and bridges 30 Hz chunks
+to 250 Hz by interpolating each commanded step over 8 cycles.
+
+**It defaults to HOLD.** Constructed without `enable_motion=True` it answers every
+controller frame with the position the arm is already at, which keeps an RSI
+session alive and commands nothing. That is what you run first on real hardware.
+
+Commanding requires `enable_motion=True` **and** a signed, approved,
+single-step envelope **and** a live session (it refuses to command from an
+unknown pose). After one step it returns to HOLD by itself.
+
+A latched `controlled_stop()` keeps replying — with `Stopflag=1` — because a
+gateway that falls silent faults the controller. Silence is not safety here.
+
+**Never validated against a real controller.** Loopback tests cover framing,
+IPOC echo, interpolation, hold/command transitions and every refusal. They do
+NOT cover 4 ms timing under load, packet loss, or how this controller reacts to
+a late reply. Establish those on the cell in HOLD mode before enabling motion.
 
 ## Process ownership
 
