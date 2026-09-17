@@ -1,0 +1,82 @@
+# KUKA dishwasher door-open experiment.
+#
+# EVERY EMPTY STRING BELOW IS DELIBERATE AND BLOCKING.
+# These are physical quantities nobody has measured yet. TOML has no null, so
+# an unset value is written as "". A plausible default would be worse than no
+# value because it would look like knowledge, so `safety.missing_config`
+# refuses arming until a human supplies it. Filling one in is a claim that the
+# value was measured on the real cell.
+
+[task]
+name         = "dishwasher_door_open"
+instruction  = "open the white dishwasher on the table"
+robot_model  = "KUKA LBR iisy 11 R1300"
+control_hz   = 30.0
+rsi_hz       = 250.0
+contact_rich = true
+notes = """Contact-rich: the gripper engages a handle and the door swings on a
+hinge. Free-space assumptions do not hold, so force/load limits and a door-motion
+region are required rather than optional."""
+
+[checkpoint]
+# Identity of the pi0.5 policy whose proposals are reviewed.
+id            = "pi05_corrected_b8/120000"
+action_space  = "absolute_joint_targets_deg"
+action_names  = ["A1", "A2", "A3", "A4", "A5", "A6", "gripper"]
+chunk_steps   = 50
+sha256        = ""   # REQUIRED: digest of the exact checkpoint used
+
+# --------------------------------------------------------------- cell geometry
+[geometry]
+handle_pose = ""   # REQUIRED: handle pose in robot base frame
+door_hinge_axis = ""   # REQUIRED: hinge origin + direction, base frame
+door_open_region = ""   # REQUIRED: expected door sweep; motion outside = stop
+table_workspace = ""   # REQUIRED: allowed Cartesian volume
+
+# ----------------------------------------------------------------- calibration
+[calibration]
+camera_intrinsics = ""  # REQUIRED: K + distortion for base and wrist
+camera_extrinsics = ""  # REQUIRED: camera poses in robot base frame
+tcp_transform = ""  # REQUIRED: verified $TOOL/TCP (flange -> tool tip)
+base_frame = ""  # REQUIRED: verified base frame definition
+gripper_polarity = ""  # REQUIRED: which value is OPEN, which is CLOSED
+
+# ---------------------------------------------------------------------- limits
+[limits]
+force_torque_limits = ""  # REQUIRED: load at which motion must abort
+max_speed = ""  # REQUIRED: speed ceiling for this task
+max_acceleration = ""  # REQUIRED: acceleration ceiling
+max_step_displacement = ""  # REQUIRED: largest displacement per supervised step
+
+# ----------------------------------------------------------------- supervision
+[supervision]
+observation_freshness_s = ""  # REQUIRED: max observation age
+heartbeat_timeout_s = ""  # REQUIRED: supervisor heartbeat timeout
+success_predicate = ""  # REQUIRED: measurable predicate for success
+
+# --------------------------------------------------------------- stop / retry
+[stop_conditions]
+# Bounded retry. Exceeding any of these halts rather than continuing to try.
+max_retries_per_subgoal = 2
+max_consecutive_no_progress = 3
+# Conditions that force a controlled stop. All are evaluated every cycle.
+stop_on = [
+  "lost_handle",                  # handle no longer detected / grasp lost
+  "unexpected_contact_or_load",   # load outside configured F/T limits
+  "door_outside_expected_region", # door motion leaves door_open_region
+  "stale_vision",                 # observation older than freshness limit
+  "commanded_observed_disagreement",  # measured motion != commanded motion
+  "heartbeat_lost",
+  "estop_engaged",
+]
+# How far measured may drift from commanded before disagreement is declared.
+commanded_observed_tolerance_deg = ""   # REQUIRED: measured on the real cell
+
+# --------------------------------------------------------------- astra-direct
+[astra_direct]
+# Mode 4 needs everything above PLUS these. It is intended to be hard to arm.
+enabled                    = false
+authorised_by = ""  # REQUIRED: named human
+bounded_action_space = ""  # REQUIRED: explicit bounds Astra may propose within
+dry_run_passed = ""  # REQUIRED: reference to a completed shadow campaign
+collision_model = ""  # REQUIRED: cell + self collision model

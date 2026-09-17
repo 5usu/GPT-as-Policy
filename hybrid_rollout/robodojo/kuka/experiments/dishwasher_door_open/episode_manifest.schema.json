@@ -1,0 +1,106 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "hybrid_rollout.robodojo.kuka.episode_manifest.v1",
+  "description": "One recorded KUKA dishwasher episode. Media files are referenced by relative path and checksum; they are NEVER committed to this repository.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "episode_id", "task", "checkpoint", "timestamps",
+               "videos", "state", "trajectory", "calibration", "outcome"],
+  "properties": {
+    "schema": {"const": "hybrid_rollout.robodojo.kuka.episode_manifest.v1"},
+    "episode_id": {"type": "string"},
+    "dataset": {"type": "string"},
+    "task": {
+      "type": "object",
+      "required": ["instruction", "name"],
+      "properties": {
+        "instruction": {"type": "string", "description": "verbatim student instruction; never rewritten to a teacher subgoal"},
+        "name": {"type": "string"}
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "required": ["id", "action_space", "action_names"],
+      "properties": {
+        "id": {"type": "string"},
+        "sha256": {"type": ["string", "null"]},
+        "action_space": {"type": "string"},
+        "action_names": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "timestamps": {
+      "type": "object",
+      "required": ["recorded_start_epoch", "recorded_end_epoch", "control_hz"],
+      "properties": {
+        "recorded_start_epoch": {"type": "number"},
+        "recorded_end_epoch": {"type": "number"},
+        "control_hz": {"type": "number"},
+        "timezone": {"type": ["string", "null"]}
+      }
+    },
+    "videos": {
+      "type": "array",
+      "description": "Recorded observation videos. Referenced, not stored here.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["camera", "path", "sha256", "n_frames", "fps", "width", "height", "first_frame_epoch"],
+        "properties": {
+          "camera": {"type": "string", "enum": ["base", "wrist"]},
+          "path": {"type": "string", "description": "relative to the episode media root, OUTSIDE this repo"},
+          "sha256": {"type": "string"},
+          "n_frames": {"type": "integer"},
+          "fps": {"type": "number"},
+          "width": {"type": "integer"},
+          "height": {"type": "integer"},
+          "first_frame_epoch": {"type": "number", "description": "wall-clock of frame 0, for state alignment"}
+        }
+      }
+    },
+    "state": {
+      "type": "object",
+      "description": "Synchronized robot state, one row per control tick.",
+      "required": ["path", "sha256", "n_rows", "columns", "first_row_epoch"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"type": "string"},
+        "n_rows": {"type": "integer"},
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "first_row_epoch": {"type": "number"}
+      }
+    },
+    "trajectory": {
+      "type": "object",
+      "description": "Original recorded commanded trajectory (the demonstration).",
+      "required": ["path", "sha256", "n_rows", "provenance"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"type": "string"},
+        "n_rows": {"type": "integer"},
+        "provenance": {"type": "string", "enum": ["recorded_demo"]}
+      }
+    },
+    "calibration": {
+      "type": "object",
+      "description": "Per-camera intrinsics/extrinsics valid for THIS episode.",
+      "required": ["intrinsics", "extrinsics", "verified"],
+      "properties": {
+        "intrinsics": {"type": ["object", "null"]},
+        "extrinsics": {"type": ["object", "null"]},
+        "verified": {"type": "boolean", "description": "false blocks any command-capable mode"}
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "description": "Known episode outcome. `source` records HOW it is known.",
+      "required": ["success", "source"],
+      "properties": {
+        "success": {"type": ["boolean", "null"]},
+        "source": {"type": "string", "enum": ["measured_predicate", "supervisor_confirmed", "unknown"],
+                   "description": "model prose is NOT an accepted source"},
+        "predicate_value": {"type": ["number", "string", "null"]},
+        "notes": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

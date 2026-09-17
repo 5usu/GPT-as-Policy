@@ -1,0 +1,99 @@
+{
+ "_provenance": "SYNTHETIC decisions shaped like upstream skill/schema.py.",
+ "obs-feasible": {
+  "request_id": "obs-feasible",
+  "mode": "student",
+  "steps": 5,
+  "reason": "proposal continues the opening motion",
+  "assessment": {
+   "execution_status": "progressing",
+   "intent_status": "aligned"
+  }
+ },
+ "obs-breaching": {
+  "request_id": "obs-breaching",
+  "mode": "student",
+  "steps": 5,
+  "reason": "continues",
+  "assessment": {
+   "execution_status": "progressing",
+   "intent_status": "aligned"
+  }
+ },
+ "obs-edit": {
+  "request_id": "obs-edit",
+  "mode": "edit",
+  "steps": 3,
+  "reason": "nudge A1 toward the handle line",
+  "edit": {
+   "delta_joint_deg": [
+    -0.5,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gripper": "keep"
+  },
+  "assessment": {
+   "execution_status": "failed",
+   "intent_status": "aligned"
+  }
+ },
+ "obs-bigedit": {
+  "request_id": "obs-bigedit",
+  "mode": "edit",
+  "steps": 3,
+  "reason": "large lateral correction",
+  "edit": {
+   "delta_joint_deg": [
+    -3.0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gripper": "keep"
+  },
+  "assessment": {
+   "execution_status": "failed",
+   "intent_status": "aligned"
+  }
+ },
+ "obs-eef": {
+  "request_id": "obs-eef",
+  "mode": "eef",
+  "steps": 3,
+  "reason": "move the tool 2 cm toward the door frame",
+  "target": {
+   "position": [
+    0.4,
+    0.1,
+    0.9
+   ],
+   "quaternion_wxyz": [
+    1,
+    0,
+    0,
+    0
+   ],
+   "gripper_closed": true
+  },
+  "assessment": {
+   "execution_status": "failed",
+   "intent_status": "misaligned"
+  }
+ },
+ "obs-stop": {
+  "request_id": "obs-stop",
+  "mode": "stop",
+  "steps": 1,
+  "reason": "task appears complete",
+  "assessment": {
+   "execution_status": "recovered",
+   "intent_status": "aligned"
+  }
+ }
+}

@@ -1,0 +1,44 @@
+{
+  "schema": "hybrid_rollout.robodojo.kuka.source.v1",
+  "status": "offline_only_no_robot_command_path_enabled",
+  "code_root": "hybrid_rollout/robodojo/kuka",
+  "relation_to_upstream": "KUKA-specific extension of the RoboDojo hybrid-rollout flow. Adapts to the upstream interfaces (skill/schema.py, robodojo_server/gate_assessment.py, robodojo_server/kinematics.py, robodojo_server/client.py tool surface) rather than introducing a parallel application.",
+  "upstream_commit": "8f3d362b077d8efb77e2a7274d5b2c20e2243846",
+  "upstream_repo": "https://github.com/anonymous-report-421/GPT-as-Policy",
+  "upstream_license": "MIT, Copyright (c) 2026 Yu-Mool Shu and Lipxin Zheng",
+  "gate_prompt_unchanged": true,
+  "gate_sha256": "5bb54e0e5b39387d3873f4d4b3eed695a3a682ac28df0dd219f69176ade9e58d",
+  "robot": {
+    "model": "KUKA LBR iisy 11 R1300",
+    "dof": 6,
+    "urdf_source": "kroshu/kuka_robot_descriptions @ ec20a39ee19caf874802c5a4d57bab17df5c0766 (Apache-2.0)",
+    "urdf_sha256": "baf72584b3e8c33b05879f819b9559aa478a95afa9da8fa40d89c917510f53f2",
+    "tcp_transform": "UNKNOWN -- custom $TOOL not identified; eef mode disabled",
+    "ik": "NOT IMPLEMENTED -- eef mode disabled"
+  },
+  "ported_from": {
+    "origin": "/home/sujal/robot-training/astra_review (separate tree, unmodified)",
+    "note": "logic re-implemented against upstream interfaces; no runtime import of that tree",
+    "source_sha256": {
+      "contract.py": "c37188a1ee3e0066a9b7ba02ffb6eb6e56a9e88351adfafd8555fac6e6eb8a5f",
+      "sanitize.py": "db866b29ef30b507813ee16e7de58fb969b8284956d9b81c7ed603556254a918",
+      "fixtures.py": "00dbf0f82e7ccb720dc8323b520b7677ae15e841b66b062053bfc9977aed6a4f",
+      "loop.py": "5572a15941037c287960ca09ede1ba08c92ddc24615709af3738e36610b253ff",
+      "upstream.py": "7ee5f49e7fc554f030e09852e4d43648a4b874b7cc9f8ab18c4ef299281400c8",
+      "validate.py": "35fd47b5e53986625c5b22c13701c63f3b22319976540d4982fb7c9e8b8363ed",
+      "diagnostics.py": "eccb982b2e84bb73a4cfc88a6b2ab9172010500bec8981a953a100456abdc08f",
+      "kinematics.py": "1fe5e6be7d8de2c21c6c2306e5c6f26eaa0cf2bc94d229f1cb640715f3672fb7"
+    }
+  },
+  "differences_from_upstream_forced_by_embodiment": [
+    "single 6-DoF arm, not a dual ARX-X5: left/right wrappers dropped",
+    "edit offsets are JOINT-SPACE degrees, not Cartesian metres/radians, because no verified TCP or IK exists",
+    "eef mode is REMOVED from the emitted schema until TCP and IK are verified",
+    "real command path is a Jetson RSI UDP/XML gateway, not a simulator RPC"
+  ],
+  "execution_status": {
+    "real_motion_possible_by_default": false,
+    "a800_role": "pi0.5 proposal only; live Astra requires A800_LIVE_REVIEW=1 and a dedicated key",
+    "jetson_role": "sole KUKA command gateway; shadow mode logs what it would emit"
+  }
+}

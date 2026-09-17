@@ -1,0 +1,83 @@
+{
+ "schema": "hybrid_rollout.robodojo.kuka.episode_manifest.v1",
+ "episode_id": "synthetic-0001",
+ "dataset": "synthetic",
+ "task": {
+  "name": "dishwasher_door_open",
+  "instruction": "open the white dishwasher on the table"
+ },
+ "checkpoint": {
+  "id": "pi05_corrected_b8/120000",
+  "sha256": null,
+  "action_space": "absolute_joint_targets_deg",
+  "action_names": [
+   "A1",
+   "A2",
+   "A3",
+   "A4",
+   "A5",
+   "A6",
+   "gripper"
+  ]
+ },
+ "timestamps": {
+  "recorded_start_epoch": 1000.0,
+  "recorded_end_epoch": 1006.033,
+  "control_hz": 30.0,
+  "timezone": "UTC"
+ },
+ "videos": [
+  {
+   "camera": "base",
+   "path": "media/base.mp4",
+   "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "n_frames": 300,
+   "fps": 30.0,
+   "width": 640,
+   "height": 480,
+   "first_frame_epoch": 1000.0
+  },
+  {
+   "camera": "wrist",
+   "path": "media/wrist.mp4",
+   "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "n_frames": 300,
+   "fps": 30.0,
+   "width": 640,
+   "height": 480,
+   "first_frame_epoch": 1000.0
+  }
+ ],
+ "state": {
+  "path": "media/state.parquet",
+  "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "n_rows": 181,
+  "columns": [
+   "A1",
+   "A2",
+   "A3",
+   "A4",
+   "A5",
+   "A6",
+   "gripper"
+  ],
+  "first_row_epoch": 1000.0
+ },
+ "trajectory": {
+  "path": "media/trajectory.parquet",
+  "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "n_rows": 181,
+  "provenance": "recorded_demo"
+ },
+ "calibration": {
+  "intrinsics": null,
+  "extrinsics": null,
+  "verified": false
+ },
+ "outcome": {
+  "success": null,
+  "source": "unknown",
+  "predicate_value": null,
+  "notes": "synthetic fixture"
+ }
+}

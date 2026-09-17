@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<robot name="lbr_iisy11_r1300">
+  <link name="base"/>
+  <link name="base_link"/>
+  <link name="flange"/>
+  <link name="link_1"/>
+  <link name="link_2"/>
+  <link name="link_3"/>
+  <link name="link_4"/>
+  <link name="link_5"/>
+  <link name="link_6"/>
+  <link name="tool0"/>
+  <joint name="joint_1" type="revolute">
+    <origin xyz="0.0 0.0 0.1845" rpy="3.141592653589793 -0.0 0.0"/>
+    <parent link="base_link"/>
+    <child link="link_1"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="4.0584E2" lower="-3.2288591125E0" upper="3.2288591125E0" velocity="3.49065850398866E0"/>
+  </joint>
+  <joint name="joint_2" type="revolute">
+    <origin xyz="0.0 0.1011 -0.1155" rpy="1.5707963267948966 0.0 -0.0"/>
+    <parent link="link_1"/>
+    <child link="link_2"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="366.247685" lower="-4.014257279586958E0" upper="8.726646259971648E-1" velocity="3.490656"/>
+  </joint>
+  <joint name="joint_3" type="revolute">
+    <origin xyz="0.59 0.0 0.0237" rpy="0.0 -0.0 0.0"/>
+    <parent link="link_2"/>
+    <child link="link_3"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="1.47189439778934E2" lower="-2.617993875E0" upper="2.617993875E0" velocity="3.49065850398866E0"/>
+  </joint>
+  <joint name="joint_4" type="revolute">
+    <origin xyz="0.1139 0.0 0.0774" rpy="1.5707963267948966 -0.0 -1.5707963267948966"/>
+    <parent link="link_3"/>
+    <child link="link_4"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="6.54825468125571E1" lower="-3.14159265E0" upper="3.14159265E0" velocity="4.01425727958696E0"/>
+  </joint>
+  <joint name="joint_5" type="revolute">
+    <origin xyz="0.0 0.0507 -0.4181" rpy="0.0 1.5707963267948966 1.5707963267948966"/>
+    <parent link="link_4"/>
+    <child link="link_5"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="6.46576468348751E1" lower="-1.919862175E0" upper="1.919862175E0" velocity="4.53785605518526E0"/>
+  </joint>
+  <joint name="joint_6" type="revolute">
+    <origin xyz="0.0837 0.0 -0.0507" rpy="1.5707963267948966 -0.0 -1.5707963267948966"/>
+    <parent link="link_5"/>
+    <child link="link_6"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="1.57202326869092E1" lower="-3.83972435E0" upper="3.83972435E0" velocity="7.50491578357562E0"/>
+  </joint>
+  <joint name="base_link-base" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="base"/>
+  </joint>
+  <joint name="link6-flange" type="fixed">
+    <origin xyz="0.0 0.0 -0.0943" rpy="0.0 1.5707963267948966 0.0"/>
+    <parent link="link_6"/>
+    <child link="flange"/>
+  </joint>
+  <joint name="link6-tool0" type="fixed">
+    <origin xyz="0.0 0.0 -0.0943" rpy="0.0 3.141592653589793 0.0"/>
+    <parent link="link_6"/>
+    <child link="tool0"/>
+  </joint>
+</robot>
