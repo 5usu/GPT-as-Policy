@@ -20,11 +20,21 @@ region are required rather than optional."""
 
 [checkpoint]
 # Identity of the pi0.5 policy whose proposals are reviewed.
-id            = "pi05_corrected_b8/120000"
+# Selected by the operator. 120000 is also available and contract-identical;
+# the distinguishing field for ANY pi0.5 checkpoint here is use_relative_actions,
+# which must be true -- the eight models under oss://i-robot-data/models/ are all
+# false and are NOT this training run.
+id            = "pi05_corrected_b8/132000"
 action_space  = "absolute_joint_targets_deg"
 action_names  = ["A1", "A2", "A3", "A4", "A5", "A6", "gripper"]
 chunk_steps   = 50
-sha256        = ""   # REQUIRED: digest of the exact checkpoint used
+sha256        = "c881c42551bfc173064f2c9f33a1ff7c61a7dfc1ad49172dc1d6c384111d72d0"
+# ^ sha256 over the 7 pretrained_model file etags in OSS. Computed, not assumed.
+oss_uri       = "oss://i-robot-data/checkpoints/pi05_corrected_b8/132000/"
+size_gb       = 9.35
+training_step = 132000
+num_processes = 7            # the 7xA100 run
+use_relative_actions = true  # internal train-time transform; output is ABSOLUTE
 
 # --------------------------------------------------------------- cell geometry
 [geometry]
