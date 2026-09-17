@@ -193,3 +193,70 @@ class TestAstraDirectCannotBypassGates:
 
     def test_shipped_config_marks_direct_disabled(self):
         assert load_config()["astra_direct"]["enabled"] is False
+
+
+class TestMatchesDeployedRobotStack:
+    """PROPERTY: our numbers match the stack that actually drives the arm.
+
+    Source of truth: KUKA/teleoperation/udp_teleoperate.py on the robot host.
+    These were wrong in the first implementation -- validated against the kroshu
+    URDF's mechanical limits rather than the operational limits the deployed code
+    enforces, and with an RSI frame that had the wrong Type, wrong line endings,
+    wrong precision and two missing elements.
+    """
+
+    def test_operational_limits_are_the_deployed_ones(self):
+        from .contract import POSITION_LIMIT_DEG
+        # udp_teleoperate.py:178-179, verbatim
+        assert [lo for lo, _ in POSITION_LIMIT_DEG] == \
+            [-184.5, -229.5, -149.5, -179.5, -109.5, -219.5]
+        assert [hi for _, hi in POSITION_LIMIT_DEG] == \
+            [184.5, 49.5, 149.5, 179.5, 109.5, 219.5]
+
+    def test_operational_limits_are_inside_mechanical_limits(self):
+        from .contract import POSITION_LIMIT_DEG, URDF_POSITION_LIMIT_DEG
+        for (lo, hi), (mlo, mhi) in zip(POSITION_LIMIT_DEG, URDF_POSITION_LIMIT_DEG):
+            assert lo > mlo and hi < mhi, "operational must be strictly inside"
+            assert abs((mhi - hi) - 0.5) < 1e-9, "the deployed inset is 0.5 deg"
+
+    def test_a_command_the_real_stack_rejects_is_rejected_here(self):
+        """The bug this fixes: 184.7 deg is inside the URDF limit but outside
+        what the deployed stack allows."""
+        from .validation import validate_chunk
+        rows = [[184.7, 0, 0, 0, 0, 0, 0.5]]
+        codes = {v.code for v in validate_chunk(rows, check_envelope=False)}
+        assert "position_limit" in codes
+
+    def test_rsi_frame_matches_the_deployed_builder(self):
+        from .transports import rsi_response_xml
+        got = rsi_response_xml(12345, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                               gripper_pos=6000, stop_flag=0)
+        expected = (
+            '<Sen Type="ImFree">\r\n'
+            '<AK A1="1.00" A2="2.00" A3="3.00" A4="4.00" A5="5.00" A6="6.00"/>\r\n'
+            '<GRIPPER_POS>6000</GRIPPER_POS>\r\n'
+            '<Stopflag>0</Stopflag>\r\n'
+            '<IPOC>12345</IPOC>\r\n'
+            '</Sen>')
+        assert got == expected
+
+    def test_rsi_rate_is_250hz(self):
+        from .transports import RSI_CYCLE_TIME, RSI_HZ
+        assert RSI_CYCLE_TIME == 0.004 and RSI_HZ == 250.0
+
+    def test_gripper_scale_matches_the_stack(self):
+        from .contract import GRIPPER_SCALE
+        from .transports import gripper_to_raw
+        assert GRIPPER_SCALE == 12000.0
+        assert gripper_to_raw(1.0) == 12000 and gripper_to_raw(0.0) == 0
+        assert gripper_to_raw(5.0) == 12000, "must clamp, not overflow"
+
+    def test_gripper_path_is_not_assumed(self):
+        """The gripper may bypass RSI entirely via Modbus RTU."""
+        from .transports import GRIPPER_PATHS
+        assert set(GRIPPER_PATHS) == {"rsi_gripper_pos", "direct_modbus_rtu"}
+
+    def test_model_identification_basis_is_recorded_honestly(self):
+        from .contract import DATASET_ROBOT_TYPE, MODEL_IDENTIFICATION_BASIS
+        assert DATASET_ROBOT_TYPE == "kuka_lbr_iico"
+        assert "never names the model" in MODEL_IDENTIFICATION_BASIS

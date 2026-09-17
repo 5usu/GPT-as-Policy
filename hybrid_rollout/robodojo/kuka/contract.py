@@ -34,10 +34,37 @@ ROBOT_MODEL = "KUKA LBR iisy 11 R1300"
 ROBOT_MODEL_SOURCE = ("kroshu/kuka_robot_descriptions @ "
                       "ec20a39ee19caf874802c5a4d57bab17df5c0766 (Apache-2.0)")
 
-# Hard controller limits, degrees, from the resolved URDF.
-POSITION_LIMIT_DEG: tuple[tuple[float, float], ...] = (
+# MECHANICAL limits from the resolved kroshu URDF, degrees.
+URDF_POSITION_LIMIT_DEG: tuple[tuple[float, float], ...] = (
     (-185.0, 185.0), (-230.0, 50.0), (-150.0, 150.0),
     (-180.0, 180.0), (-110.0, 110.0), (-220.0, 220.0))
+
+# OPERATIONAL limits actually enforced by the deployed teleoperation stack
+# (KUKA/teleoperation/udp_teleoperate.py:178-179). Every joint is inset 0.5 deg
+# from the mechanical limit. THESE are what this package validates against: a
+# command the deployed stack would reject must not pass here, and validating
+# against the wider URDF numbers would have let 0.5 deg of unreachable travel
+# through on every joint.
+POSITION_LIMIT_DEG: tuple[tuple[float, float], ...] = (
+    (-184.5, 184.5), (-229.5, 49.5), (-149.5, 149.5),
+    (-179.5, 179.5), (-109.5, 109.5), (-219.5, 219.5))
+POSITION_LIMIT_SOURCE = ("KUKA/teleoperation/udp_teleoperate.py JOINT_LIMITS_MIN/MAX; "
+                         "0.5 deg inset from the kroshu URDF mechanical limits")
+
+# The robot_type string the recording/conversion stack actually uses. NOTE it is
+# "iico", not "iisy": the model identification (LBR iisy 11 R1300) comes from the
+# operator plus an exact match against the kroshu URDF limits, NOT from any
+# string in the robot code, which never names the model.
+DATASET_ROBOT_TYPE = "kuka_lbr_iico"
+MODEL_IDENTIFICATION_BASIS = (
+    "operator identification, corroborated by all six joint limits matching the "
+    "kroshu lbr_iisy11_r1300 URDF to within the deployed 0.5 deg safety inset. "
+    "The teleoperation codebase itself never names the model.")
+
+# Gripper: the deployed stack normalises a raw integer 0..GRIPPER_SCALE to 0..1
+# (udp_teleoperate.py:190). Chunk values are the NORMALISED form; the RSI frame
+# carries the raw integer.
+GRIPPER_SCALE = 12000.0
 VELOCITY_LIMIT_RAD_S: tuple[float, ...] = (
     3.49065850398866, 3.490656, 3.49065850398866,
     4.01425727958696, 4.53785605518526, 7.50491578357562)

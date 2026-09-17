@@ -31,10 +31,23 @@ SCHEMA = "hybrid_rollout.robodojo.kuka.transports.v1"
 # controller sends <Rob> with AIPos/RIst and expects <Sen> back carrying the same
 # IPOC. That IPOC echo is what makes an RSI exchange idempotent.
 RSI_DEFAULT_PORT = 59152
-RSI_HZ = 250.0
-RSI_REQUEST_ROOT = "Rob"
-RSI_RESPONSE_ROOT = "Sen"
+RSI_CYCLE_TIME = 0.004            # udp_teleoperate.py:127
+RSI_HZ = 1.0 / RSI_CYCLE_TIME     # 250 Hz
+RSI_LOCAL_IP_ENV = "KUKA_LOCAL_IP"
+RSI_LOCAL_IP_DEFAULT = "172.17.255.2"
 RSI_IPOC_FIELD = "IPOC"
+# The controller's <Sen> Type attribute is "ImFree", NOT "KUKA"
+# (udp_teleoperate.py:283). Verified against the deployed stack.
+RSI_RESPONSE_ROOT = "Sen"
+RSI_SEN_TYPE = "ImFree"
+RSI_LINE_ENDING = "\r\n"
+RSI_JOINT_PRECISION = 2           # the stack formats AK values as :.2f
+
+# Gripper does NOT necessarily travel over RSI. The deployed stack offers two
+# paths (udp_teleoperate.py:24-34): <GRIPPER_POS> inside the RSI frame via the
+# KUKA SPS, or direct Modbus RTU over USB-RS485 from the Jetson. Which one is in
+# use is a deployment fact this package does not assume.
+GRIPPER_PATHS = ("rsi_gripper_pos", "direct_modbus_rtu")
 
 
 class ProposalSource(Protocol):
@@ -256,14 +269,31 @@ class FakeKukaGateway:
                 "measured": list(achieved) if achieved is not None else list(rows)}
 
 
-def rsi_response_xml(ipoc: int, joints_deg: Sequence[float]) -> str:
+def rsi_response_xml(ipoc: int, joints_deg: Sequence[float], *,
+                     gripper_pos: int = 0, stop_flag: int = 0) -> str:
     """The <Sen> frame the Jetson returns to the controller, IPOC echoed.
 
-    Included for the deployment engineer to check against the real .src files in
-    teleoperation/trigger_RSI. It is NOT sent by anything in this package.
+    Byte-compatible with the deployed builder in
+    KUKA/teleoperation/udp_teleoperate.py:282-291 -- same Type, same CRLF line
+    endings, same 2-decimal AK formatting, and the same GRIPPER_POS/Stopflag
+    elements. An earlier version of this function was wrong on all four counts;
+    it is now pinned by a test so it cannot drift from the real stack again.
+
+    NOTHING IN THIS PACKAGE SENDS IT. This exists so the deployment engineer can
+    diff it against the real gateway.
     """
-    ak = " ".join(f'A{i + 1}="{v:.4f}"' for i, v in enumerate(joints_deg[:6]))
-    return (f'<{RSI_RESPONSE_ROOT} Type="KUKA">'
-            f'<AK {ak}/>'
-            f'<{RSI_IPOC_FIELD}>{ipoc}</{RSI_IPOC_FIELD}>'
+    j = list(joints_deg[:6])
+    nl = "\r\n"
+    ak = " ".join(f'A{i + 1}="{v:.{RSI_JOINT_PRECISION}f}"' for i, v in enumerate(j))
+    return (f'<{RSI_RESPONSE_ROOT} Type="{RSI_SEN_TYPE}">{nl}'
+            f'<AK {ak}/>{nl}'
+            f'<GRIPPER_POS>{gripper_pos}</GRIPPER_POS>{nl}'
+            f'<Stopflag>{stop_flag}</Stopflag>{nl}'
+            f'<{RSI_IPOC_FIELD}>{ipoc}</{RSI_IPOC_FIELD}>{nl}'
             f'</{RSI_RESPONSE_ROOT}>')
+
+
+def gripper_to_raw(normalised: float) -> int:
+    """0..1 chunk value -> the raw integer the deployed stack sends."""
+    from .contract import GRIPPER_SCALE
+    return int(min(1.0, max(0.0, float(normalised))) * GRIPPER_SCALE)
