@@ -98,6 +98,72 @@ class OfflineProposalSource:
                 "is_live": False}
 
 
+class RecordedTrajectorySource:
+    """Phase 2's proposal source: the RECORDED HUMAN DEMONSTRATION.
+
+    This is deliberately not pi0.5. Phase 2 asks what a successful episode looks
+    like by actually performing one, and the safest trajectory to perform is the
+    one a human already performed successfully on this cell. It also has a
+    property the model output does not: measured on real val_ood data the demo's
+    largest target-to-target step is 3.089 deg, comfortably inside joint_2's
+    6.667 deg/step cap at 30 Hz, whereas the pi0.5 chunk's 6.992 deg A2 step
+    exceeds it. The demo is executable as recorded; the model proposal is not.
+
+    Provenance is reported as `recorded_demo` and must stay that way: a
+    demonstration replayed through the gates is evidence about the task, never a
+    model prediction.
+    """
+
+    name = "recorded_demo_trajectory"
+    is_live = False
+    provenance = "recorded_demo"
+
+    def __init__(self, chunks_by_observation: dict[str, list[list[float]]],
+                 episode_id: str | None = None) -> None:
+        self.chunks = dict(chunks_by_observation)
+        self.episode_id = episode_id
+
+    def propose(self, observation: dict[str, Any]) -> dict[str, Any]:
+        oid = observation.get("observation_id")
+        rows = self.chunks.get(oid)
+        if rows is None:
+            return {"ok": False, "error": f"no recorded trajectory at {oid}"}
+        return {"ok": True, "rows": [list(r) for r in rows],
+                "checkpoint_id": None, "source": self.name, "is_live": False,
+                "provenance": self.provenance,
+                "note": ("recorded human demonstration; NOT a model proposal")}
+
+
+class BoundedAstraProposalSource:
+    """Phase 3: Astra proposes its own action inside an explicit bounded space.
+
+    Refuses to produce anything unless a bounded action space was configured.
+    There is no default bound -- an unbounded self-proposal is the one thing this
+    whole package exists to prevent.
+    """
+
+    name = "astra_direct"
+    is_live = False
+    provenance = "astra_direct"
+
+    def __init__(self, proposer=None, bounded_action_space: Any = None) -> None:
+        self.proposer = proposer
+        self.bounds = bounded_action_space
+
+    def propose(self, observation: dict[str, Any]) -> dict[str, Any]:
+        if self.bounds in (None, "", [], {}):
+            return {"ok": False,
+                    "error": ("no bounded_action_space configured; direct "
+                              "proposal refused")}
+        if self.proposer is None:
+            return {"ok": False, "error": "no direct proposer configured"}
+        rows = self.proposer(observation, self.bounds)
+        if not rows:
+            return {"ok": False, "error": "proposer returned nothing"}
+        return {"ok": True, "rows": [list(r) for r in rows], "source": self.name,
+                "is_live": False, "provenance": self.provenance}
+
+
 class UnconfiguredReview:
     """Default review source. Fails loudly rather than pretending."""
 
