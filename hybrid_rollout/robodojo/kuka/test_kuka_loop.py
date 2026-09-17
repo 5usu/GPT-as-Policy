@@ -315,3 +315,63 @@ class TestAuditFormat:
         rec = loop(Mode.REVIEWED_EXECUTION, gateway=gw).step(observation())
         assert "signature" not in rec.envelope
         assert rec.envelope["signature_present"] is True
+
+
+class TestReviewPacketReachesTheReviewer:
+    """PROPERTY: the loop hands the reviewer the full gate packet, not just an id."""
+
+    class _Capture:
+        name = "capture"
+        is_live = False
+
+        def __init__(self):
+            self.packets = []
+
+        def review(self, packet):
+            self.packets.append(packet)
+            return {"ok": True, "decision": dict(decisions()["obs-feasible"])}
+
+    def obs(self):
+        return {**observation(), "task": "open the white dishwasher on the table",
+                "frames": {"base": {"frame_index": 3, "frame_path": "/m/frames/base_000003.png",
+                                    "frame_present": True}},
+                "images": {"base": "SU1BR0VCWVRFUw=="},
+                "image_data_urls": ["data:image/png;base64,SU1BR0VCWVRFUw=="]}
+
+    def test_packet_carries_gate_prompt_schema_task_and_images(self):
+        cap = self._Capture()
+        lp = loop(Mode.LIVE_SHADOW)
+        lp.review_source = cap
+        lp.step(self.obs())
+        (p,) = cap.packets
+        assert p["request_id"] == "obs-feasible"
+        assert {"system", "user_text", "response_schema"} <= set(p)
+        assert "open the white dishwasher on the table" in p["user_text"]
+        assert "base_000003.png" in p["user_text"]
+        assert p["provenance"] == "model_predicted"
+        assert p["image_data_urls"] == ["data:image/png;base64,SU1BR0VCWVRFUw=="]
+
+    def test_a_live_astra_source_can_build_a_body_from_the_loop_packet(self):
+        from .transports import AstraReviewSource
+        sent = []
+        a = AstraReviewSource(base_url="https://x", model="m", api_key_env="NOPE",
+                              transport=lambda *args: sent.append(args))
+        lp = loop(Mode.LIVE_SHADOW)
+        lp.review_source = a
+        rec = lp.step(self.obs())
+        assert rec.review["ok"] is False and sent == []     # dry run: built, not sent
+        assert rec.outcome == Outcome.NO_DECISION.value
+
+    def test_image_bytes_are_not_written_to_the_audit(self, tmp_path):
+        log = AuditLog(tmp_path / "a.jsonl")
+        loop(Mode.LIVE_SHADOW, audit=log).step(self.obs())
+        text = log.path.read_text()
+        assert "SU1BR0VCWVRFUw" not in text
+        row = json.loads(text.splitlines()[0])
+        assert row["observation"]["images_attached"] == ["base"]
+
+    def test_astra_source_refuses_an_incomplete_packet_instead_of_raising(self):
+        from .transports import AstraReviewSource
+        a = AstraReviewSource(base_url="https://x", model="m", api_key_env="NOPE")
+        r = a.review({"request_id": "o", "mode": "live_shadow"})
+        assert r["ok"] is False and "packet" in r["error"]

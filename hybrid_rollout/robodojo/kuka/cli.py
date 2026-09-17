@@ -18,6 +18,7 @@ outright in phases that are structurally observation-only.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 import time
@@ -359,6 +360,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     ep = _episode(args)
     samples = ep.sample_ticks(every=args.every, chunk_steps=args.chunk_steps,
                               limit=args.limit)
+    missing = [f"{s.observation_id}/{cam}" for s in samples
+               for cam, f in s.frames.items() if not f.get("frame_present")]
+    if missing:
+        print(f"  REFUSED: pi0.5 needs the camera frames and {len(missing)} are not "
+              f"extracted (e.g. {missing[0]}). Pass --media-root and extract "
+              f"<media_root>/frames/<camera>_<frame:06d>.png first.", file=sys.stderr)
+        return 2
     fk = make_fk()
     audit = AuditLog(args.audit or "live_loop_audit.jsonl")
     loop = KukaReviewLoop(
@@ -369,17 +377,33 @@ def cmd_run(args: argparse.Namespace) -> int:
                              "172.17.255.2", 59152),
         allowlist=[], supervisor=Supervisor(), ledger=CommandLedger(), secret=None)
     print()
+    answered, tokens = 0, 0
     for s in samples:
+        images = {cam: base64.b64encode(Path(f["frame_path"]).read_bytes()).decode()
+                  for cam, f in sorted(s.frames.items())}
         obs = {"observation_id": s.observation_id, "state": s.state,
-               "epoch": time.time(), "task": ep.m.instruction}
+               "epoch": time.time(), "task": ep.m.instruction, "frames": s.frames,
+               "images": images,
+               "image_data_urls": [f"data:image/png;base64,{b}" for b in images.values()]}
         rec = loop.step(obs)
         d = rec.decision or {}
+        rv = rec.review or {}
+        if rv.get("ok") and rv.get("is_live"):
+            answered += 1
+            tokens += int((rv.get("usage") or {}).get("total_tokens") or 0)
         print(f"  {s.observation_id:26s} {rec.outcome:16s} "
-              f"mode={d.get('mode','-'):8s} safe={rec.execution_safe} "
-              f"{rec.reason[:44]}")
+              f"mode={d.get('mode','-'):8s} steps={d.get('steps','-')!s:3s} "
+              f"safe={rec.execution_safe} {rec.reason[:60]}")
+        if d.get("reason"):
+            print(f"      astra: {str(d['reason'])[:150]}")
+        elif rv.get("dry_run"):
+            print("      review: dry run -- request built and hashed, not sent")
+        elif rv.get("error"):
+            print(f"      review: {str(rv['error'])[:150]}")
     print(f"\n  audit -> {audit.path}")
     print("  commands sent: 0 (shadow). Astra: "
-          f"{'live calls made' if args.astra_live else 'dry run, nothing sent'}")
+          + (f"{answered} live review(s) answered, {tokens} total tokens"
+             if args.astra_live else "dry run, nothing sent"))
     return 0
 
 

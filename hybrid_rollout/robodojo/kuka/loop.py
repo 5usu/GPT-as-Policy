@@ -35,6 +35,7 @@ from .eef import CartesianCapability, eef_eligible, validate_target
 from .interfaces import cartesian_capability, modes_locked
 from .experiment import CameraAssessment, assess_success, retry_limits, stop_conditions
 from .kinematics import UnavailableFK
+from .packet import build_packet
 from .safety import (ArmingRefused, CommandLedger, Mode, RobotIdentity, Supervisor,
                      authorise, missing_config, require_command_capable)
 from .sanitize import sanitize
@@ -153,6 +154,20 @@ class AuditLog:
         return row
 
 
+#: Observation keys that carry image bytes. They go to the policy and the
+#: reviewer, never into the audit row -- the row records which were attached.
+_IMAGE_KEYS = ("images", "image_data_urls")
+
+
+def _loggable_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    obs = {k: v for k, v in observation.items() if k not in _IMAGE_KEYS}
+    if observation.get("images"):
+        obs["images_attached"] = sorted(observation["images"])
+    if observation.get("image_data_urls"):
+        obs["image_data_urls_attached"] = len(observation["image_data_urls"])
+    return obs
+
+
 def evaluate_stop_signals(*, configured: Sequence[str], observation: dict[str, Any],
                           feedback: dict[str, Any] | None,
                           tolerance_deg: float | None) -> list[str]:
@@ -252,7 +267,7 @@ class KukaReviewLoop:
         now = time.time() if now is None else now
         self.cycle += 1
         rec = CycleRecord(mode=self.mode.value, cycle=self.cycle,
-                          observation=dict(observation))
+                          observation=_loggable_observation(observation))
         limits = retry_limits(self.raw_config)
         conds = stop_conditions(self.raw_config)
         tol = (self.raw_config.get("stop_conditions") or {}).get(
@@ -303,12 +318,25 @@ class KukaReviewLoop:
         if self.review_source is None:
             return self._finish(rec, Stage.REVIEW, Outcome.NO_DECISION,
                                 "no review source configured")
-        packet = {"request_id": observation.get("observation_id"),
-                  "mode": self.mode.value}
+        provenance = (prop.get("provenance")
+                      or getattr(self.proposal_source, "provenance", None)
+                      or "model_predicted")
+        try:
+            packet = build_packet(
+                task_instruction=str(observation.get("task", "")),
+                observation_id=str(observation.get("observation_id", "")),
+                state=state, chunk=rows, provenance=provenance,
+                frames=observation.get("frames") or {}, fk_preview=rec.fk_preview)
+        except (TypeError, ValueError, IndexError) as exc:
+            return self._finish(rec, Stage.REVIEW, Outcome.NO_DECISION,
+                                f"could not build review packet: {exc}")
+        packet["mode"] = self.mode.value
+        packet["image_data_urls"] = list(observation.get("image_data_urls") or [])
         rv = self.review_source.review(packet)
         rec.review = {"source": getattr(self.review_source, "name", "?"),
                       "is_live": bool(getattr(self.review_source, "is_live", False)),
-                      "ok": bool(rv.get("ok")), "error": rv.get("error")}
+                      "ok": bool(rv.get("ok")), "error": rv.get("error"),
+                      "dry_run": bool(rv.get("dry_run")), "usage": rv.get("usage")}
         if not rv.get("ok"):
             return self._finish(rec, Stage.REVIEW, Outcome.NO_DECISION,
                                 str(rv.get("error", "review failed")))

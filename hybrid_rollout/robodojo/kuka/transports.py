@@ -306,7 +306,11 @@ class AstraReviewSource:
     def review(self, packet: dict[str, Any]) -> dict[str, Any]:
         import hashlib as _h
         import json as _json
-        body = self.build_body(packet, packet.get("image_data_urls"))
+        try:
+            body = self.build_body(packet, packet.get("image_data_urls"))
+        except KeyError as exc:
+            return {"ok": False, "error": f"review packet is missing {exc}; build it "
+                                          "with packet.build_packet"}
         digest = _h.sha256(_json.dumps(body, sort_keys=True).encode()).hexdigest()[:12]
         if self.dry_run:
             return {"ok": False, "dry_run": True, "body_sha256_12": digest,
