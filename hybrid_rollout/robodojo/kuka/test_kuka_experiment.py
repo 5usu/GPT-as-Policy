@@ -170,3 +170,62 @@ class TestCliGating:
     def test_phase3_refuses(self, capsys):
         assert cli_main(["phase3"]) == 2
         assert "REFUSED" in capsys.readouterr().out
+
+
+class TestLiveSourcesAreOffByDefault:
+    """PROPERTY: nothing live happens unless explicitly switched on."""
+
+    def test_astra_defaults_to_dry_run(self):
+        from .transports import AstraReviewSource
+        a = AstraReviewSource(base_url="https://x", model="m", api_key_env="NOPE")
+        assert a.enabled is False and a.dry_run is True
+        assert a.preflight()[0] is False
+
+    def test_dry_run_returns_a_hash_and_sends_nothing(self):
+        from .transports import AstraReviewSource
+        called = []
+        a = AstraReviewSource(base_url="https://x", model="m", api_key_env="NOPE",
+                              transport=lambda *args: called.append(args))
+        pkt = build_packet(task_instruction="t", observation_id="o",
+                           state=[0.0] * 7, chunk=[[0.0] * 7],
+                           provenance="model_predicted", frames={})
+        r = a.review(pkt)
+        assert r["dry_run"] is True and len(r["body_sha256_12"]) == 12
+        assert called == [], "dry run must not reach the transport"
+
+    def test_live_without_key_refuses(self, monkeypatch):
+        from .transports import AstraReviewSource
+        monkeypatch.delenv("NO_SUCH_KEY", raising=False)
+        a = AstraReviewSource(base_url="https://x", model="m",
+                              api_key_env="NO_SUCH_KEY", enabled=True, dry_run=False)
+        pkt = build_packet(task_instruction="t", observation_id="o",
+                           state=[0.0] * 7, chunk=[[0.0] * 7],
+                           provenance="model_predicted", frames={})
+        assert a.review(pkt)["ok"] is False
+
+    def test_body_never_contains_the_credential(self, monkeypatch):
+        from .transports import AstraReviewSource
+        monkeypatch.setenv("FAKE_KEY", "super-secret-value")
+        a = AstraReviewSource(base_url="https://x", model="m", api_key_env="FAKE_KEY")
+        pkt = build_packet(task_instruction="t", observation_id="o",
+                           state=[0.0] * 7, chunk=[[0.0] * 7],
+                           provenance="model_predicted", frames={})
+        assert "super-secret-value" not in json.dumps(a.build_body(pkt))
+
+    def test_pi05_source_refuses_a_wrong_checkpoint(self):
+        """use_relative_actions=False means a different training run."""
+        from .transports import Pi05HttpProposalSource
+        src = Pi05HttpProposalSource("http://x", transport=lambda u, p, t: {
+            "ok": True, "rows": [[0.0] * 7],
+            "meta": {"use_relative_actions": False}})
+        r = src.propose({"state": [0.0] * 7})
+        assert r["ok"] is False and "wrong checkpoint" in r["error"]
+
+    def test_pi05_source_accepts_the_right_checkpoint(self):
+        from .transports import Pi05HttpProposalSource
+        src = Pi05HttpProposalSource("http://x", transport=lambda u, p, t: {
+            "ok": True, "rows": [[1.0] * 7], "checkpoint_id": "ck",
+            "meta": {"use_relative_actions": True}})
+        r = src.propose({"state": [0.0] * 7})
+        assert r["ok"] is True and r["is_live"] is True
+        assert r["provenance"] == "model_predicted"

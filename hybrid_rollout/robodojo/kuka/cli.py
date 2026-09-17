@@ -163,6 +163,73 @@ def cmd_phase2(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    """Live loop: pi0.5 (real checkpoint) -> FK -> Astra -> sanitize -> validate.
+
+    Commands are SHADOW unless every gate passes, and Astra is DRY-RUN unless
+    --astra-live is passed. Both are off by default so a first run costs nothing
+    and touches nothing.
+    """
+    from .transports import AstraReviewSource, Pi05HttpProposalSource
+    cfg = load_config(args.experiment)
+    flat = flatten_config(cfg)
+    miss = missing_config(flat, Mode.REVIEWED_EXECUTION)
+    _banner("LIVE LOOP: pi0.5 + Astra", Mode.LIVE_SHADOW, miss)
+
+    src = Pi05HttpProposalSource(args.pi05_url,
+                                 checkpoint_id=cfg["checkpoint"]["id"],
+                                 expected_sha256=cfg["checkpoint"].get("sha256"))
+    try:
+        h = src.health()
+        m = h.get("meta") or {}
+        print(f"  pi0.5 server : {args.pi05_url}  ok={h.get('ok')}")
+        print(f"  checkpoint   : {m.get('checkpoint')}")
+        print(f"  use_rel_act  : {m.get('use_relative_actions')} "
+              f"{'OK' if m.get('use_relative_actions') is True else '<-- WRONG CHECKPOINT'}")
+        print(f"  chunk        : {m.get('chunk_size')}/{m.get('n_action_steps')}")
+    except Exception as exc:
+        print(f"  pi0.5 server UNREACHABLE at {args.pi05_url}: "
+              f"{type(exc).__name__}. Start it on the A800 with "
+              f"`python -m hybrid_rollout.robodojo.kuka.pi05_serve`.", file=sys.stderr)
+        return 2
+
+    review = AstraReviewSource(
+        base_url=args.astra_url, model=args.astra_model,
+        api_key_env=args.astra_key_env, enabled=args.astra_live,
+        dry_run=not args.astra_live, reasoning=args.astra_effort)
+    ok, why = review.preflight()
+    print(f"  astra        : {'LIVE (PAID)' if args.astra_live else 'DRY RUN'} -- {why}")
+    if args.astra_live and not ok:
+        print(f"  REFUSED: {why}", file=sys.stderr)
+        return 2
+
+    ep = _episode(args)
+    samples = ep.sample_ticks(every=args.every, chunk_steps=args.chunk_steps,
+                              limit=args.limit)
+    fk = make_fk()
+    audit = AuditLog(args.audit or "live_loop_audit.jsonl")
+    loop = KukaReviewLoop(
+        mode=Mode.LIVE_SHADOW, config=flat, raw_config=cfg,
+        proposal_source=src, review_source=review, gateway=ShadowGateway(),
+        fk=fk, audit=audit,
+        target=RobotIdentity(ROBOT_MODEL, args.serial or "UNSET",
+                             "172.17.255.2", 59152),
+        allowlist=[], supervisor=Supervisor(), ledger=CommandLedger(), secret=None)
+    print()
+    for s in samples:
+        obs = {"observation_id": s.observation_id, "state": s.state,
+               "epoch": time.time(), "task": ep.m.instruction}
+        rec = loop.step(obs)
+        d = rec.decision or {}
+        print(f"  {s.observation_id:26s} {rec.outcome:16s} "
+              f"mode={d.get('mode','-'):8s} safe={rec.execution_safe} "
+              f"{rec.reason[:44]}")
+    print(f"\n  audit -> {audit.path}")
+    print("  commands sent: 0 (shadow). Astra: "
+          f"{'live calls made' if args.astra_live else 'dry run, nothing sent'}")
+    return 0
+
+
 def cmd_phase3(args: argparse.Namespace) -> int:
     """Astra proposes the actions itself, through the identical gate chain."""
     cfg = load_config(args.experiment)
@@ -210,6 +277,18 @@ def main(argv=None) -> int:
     p2.add_argument("--arm", action="store_true",
                     help="attempt real execution; refuses unless every gate passes")
     p2.set_defaults(func=cmd_phase2)
+
+    rn = sub.add_parser("run", help="live pi0.5 + Astra loop (shadow commands)")
+    common(rn)
+    rn.add_argument("--pi05-url", default="http://127.0.0.1:8710")
+    rn.add_argument("--astra-url", default="https://api.openai.com/v1/responses")
+    rn.add_argument("--astra-model", default="gpt-6-astra")
+    rn.add_argument("--astra-key-env", default="OPENAI_API_KEY")
+    rn.add_argument("--astra-effort", default="low")
+    rn.add_argument("--astra-live", action="store_true",
+                    help="MAKE PAID API CALLS. Off by default.")
+    rn.add_argument("--audit"); rn.add_argument("--serial")
+    rn.set_defaults(func=cmd_run)
 
     p3 = sub.add_parser("phase3")
     p3.add_argument("--experiment", default="dishwasher_door_open")

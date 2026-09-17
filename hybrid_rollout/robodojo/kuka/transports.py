@@ -177,6 +177,190 @@ class BoundedAstraProposalSource:
                 "is_live": False, "provenance": self.provenance}
 
 
+class Pi05HttpProposalSource:
+    """LIVE pi0.5 proposals from the A800 inference server.
+
+    is_live is True, and that flag propagates into every audit row: a run driven
+    by the real checkpoint must never be indistinguishable from a replay.
+
+    The server is expected to be reachable ONLY from the A800/eng-1 side. The
+    Jetson does not call it directly in the staged rollout -- proposals are
+    fetched, reviewed, gated and only then does anything reach the robot host.
+    """
+
+    name = "pi05_live"
+    is_live = True
+    provenance = "model_predicted"
+
+    def __init__(self, base_url: str, *, checkpoint_id: str | None = None,
+                 expected_sha256: str | None = None, timeout: float = 120.0,
+                 transport=None) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.checkpoint_id = checkpoint_id
+        self.expected_sha256 = expected_sha256
+        self.timeout = timeout
+        self.transport = transport      # injectable for tests; no network by default
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.transport is not None:
+            return self.transport(self.base_url + path, payload, self.timeout)
+        import json as _json
+        import urllib.request
+        req = urllib.request.Request(
+            self.base_url + path, data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return _json.loads(r.read().decode())
+
+    def health(self) -> dict[str, Any]:
+        import json as _json
+        import urllib.request
+        with urllib.request.urlopen(self.base_url + "/health", timeout=15) as r:
+            return _json.loads(r.read().decode())
+
+    def propose(self, observation: dict[str, Any]) -> dict[str, Any]:
+        try:
+            res = self._post("/infer", {
+                "state": list(observation.get("state") or []),
+                "images": observation.get("images") or {},
+                "task": observation.get("task", "")})
+        except Exception as exc:                               # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error", "inference failed")}
+        meta = res.get("meta") or {}
+        # Refuse a checkpoint whose contract does not match what this package
+        # was built against. Silently accepting it is how you get joint targets
+        # in the wrong space.
+        if meta.get("use_relative_actions") is not True:
+            return {"ok": False,
+                    "error": ("server loaded a checkpoint with "
+                              f"use_relative_actions={meta.get('use_relative_actions')}; "
+                              "expected True. This is almost certainly the wrong "
+                              "checkpoint -- refusing.")}
+        return {"ok": True, "rows": [list(r) for r in res["rows"]],
+                "checkpoint_id": res.get("checkpoint_id") or self.checkpoint_id,
+                "source": self.name, "is_live": True,
+                "provenance": self.provenance, "server_meta": meta}
+
+
+class AstraReviewSource:
+    """LIVE Astra review. MAKES A PAID API CALL.
+
+    Off unless explicitly constructed with enabled=True and a credential env var
+    that is actually populated. `dry_run` builds and hashes the request body and
+    returns it WITHOUT sending, so a run can be costed and inspected first.
+
+    The credential is read from the environment by NAME and never stored,
+    logged, printed or placed in any returned structure.
+    """
+
+    name = "astra_live"
+    is_live = True
+
+    def __init__(self, *, base_url: str, model: str, api_key_env: str,
+                 enabled: bool = False, dry_run: bool = True,
+                 reasoning: str | None = None, store: bool = False,
+                 timeout: float = 180.0, transport=None) -> None:
+        self.base_url = base_url
+        self.model = model
+        self.api_key_env = api_key_env
+        self.enabled = bool(enabled)
+        self.dry_run = bool(dry_run)
+        self.reasoning = reasoning
+        self.store = store
+        self.timeout = timeout
+        self.transport = transport
+
+    def preflight(self) -> tuple[bool, str]:
+        if not self.enabled:
+            return False, "AstraReviewSource constructed with enabled=False"
+        if not os.environ.get(self.api_key_env):
+            return False, f"${self.api_key_env} is empty"
+        return True, "ready"
+
+    def build_body(self, packet: dict[str, Any],
+                   images: list[str] | None = None) -> dict[str, Any]:
+        content: list[Any] = [{"type": "input_text", "text": packet["user_text"]}]
+        for url in images or []:
+            content.append({"type": "input_image", "image_url": url})
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": [{"role": "system", "content": packet["system"]},
+                      {"role": "user", "content": content}],
+            "text": {"format": {"type": "json_schema", "name": "kuka_action_review",
+                                "schema": packet["response_schema"], "strict": True}},
+            "store": bool(self.store)}
+        if self.reasoning:
+            body["reasoning"] = {"effort": self.reasoning}
+        return body
+
+    def review(self, packet: dict[str, Any]) -> dict[str, Any]:
+        import hashlib as _h
+        import json as _json
+        body = self.build_body(packet, packet.get("image_data_urls"))
+        digest = _h.sha256(_json.dumps(body, sort_keys=True).encode()).hexdigest()[:12]
+        if self.dry_run:
+            return {"ok": False, "dry_run": True, "body_sha256_12": digest,
+                    "would_send_bytes": len(_json.dumps(body)),
+                    "model": self.model, "endpoint": self.base_url,
+                    "note": "DRY RUN -- nothing sent. Set dry_run=False to call."}
+        ok, why = self.preflight()
+        if not ok:
+            return {"ok": False, "error": why, "body_sha256_12": digest}
+        try:
+            raw = (self.transport or _urllib_post)(
+                self.base_url, body,
+                {"Authorization": f"Bearer {os.environ[self.api_key_env]}",
+                 "Content-Type": "application/json"}, self.timeout)
+        except Exception as exc:                               # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300],
+                    "body_sha256_12": digest}
+        text, usage = _extract_text(raw)
+        if text is None:
+            return {"ok": False, "error": "no text in response", "usage": usage,
+                    "body_sha256_12": digest}
+        try:
+            decision = _json.loads(text)
+        except Exception:
+            return {"ok": False, "error": "response was not valid JSON",
+                    "raw_text": text[:2000], "body_sha256_12": digest}
+        return {"ok": True, "decision": decision, "usage": usage,
+                "source": self.name, "is_live": True, "body_sha256_12": digest}
+
+
+def _urllib_post(url: str, body: dict, headers: dict, timeout: float) -> dict:
+    """One attempt. No retries, no fallback model."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, data=_json.dumps(body).encode(),
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return _json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:1500]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code} {e.reason}: {detail}") from None
+
+
+def _extract_text(raw: Any) -> tuple[str | None, dict | None]:
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if not isinstance(raw, dict):
+        return None, usage
+    if isinstance(raw.get("output_text"), str):
+        return raw["output_text"], usage
+    for item in raw.get("output") or []:
+        for part in (item or {}).get("content") or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                return part["text"], usage
+    return None, usage
+
+
 class UnconfiguredReview:
     """Default review source. Fails loudly rather than pretending."""
 
