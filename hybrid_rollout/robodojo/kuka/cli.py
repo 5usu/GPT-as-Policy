@@ -87,6 +87,15 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         print(f"    {m:14s} LOCKED -- {whyl[:80]}")
     print()
 
+    rt = I and __import__("hybrid_rollout.robodojo.kuka.cell", fromlist=["x"]).probe_runtime()
+    print("CELL STATE")
+    print(f"  baseline was taken WITH RSI OFF -- resting state, not an invariant")
+    print(f"  live local probe : udp/{I.RSI_UDP_PORT} "
+          f"{'in use' if rt['jetson_rsi_socket_bound'] else 'free'}")
+    print(f"  trigger/program  : {rt['ext_trigger_open']} / {rt['rsi_program_running']}"
+          f"  (None = not probed; run `gonogo --probe-network` on the Jetson)")
+    print()
+
     print("GATEWAY READINESS (HOLD only; says nothing about motion)")
     r = RSIGateway(host=args.rsi_host, port=I.RSI_UDP_PORT).readiness()
     okh, blockers = r.ready_for_hold()
@@ -201,25 +210,39 @@ def cmd_gonogo(args: argparse.Namespace) -> int:
     p = _P(args.config)
     cfg = dc.load(p) if p.exists() else dc.blank()
 
-    # Gates that are about the CELL rather than measured values.
+    # Gates about the CELL rather than measured values. These use a LIVE probe,
+    # never the recorded baseline: that baseline was taken with RSI deliberately
+    # off, so treating it as current would permanently report "not running" even
+    # after the engineer starts it.
     cart_ok, cart_why = I.cartesian_capability()
+    rt = C.probe_runtime(allow_network=args.probe_network)
+    hold_blockers = []
+    if rt["ext_trigger_open"] is None:
+        hold_blockers.append(
+            f"tcp/{C.PORT_EXT_TRIGGER_TCP} state UNKNOWN -- re-run with "
+            f"--probe-network from the Jetson to observe it")
+    elif not rt["ext_trigger_open"]:
+        hold_blockers.append(
+            f"controller-side trigger tcp/{C.PORT_EXT_TRIGGER_TCP} not reachable; "
+            f"the RSI program is not started")
+    if rt["rsi_program_running"] is not True:
+        hold_blockers.append(
+            "RSI program state is only proven by receiving a Rob frame; run the "
+            "HOLD handshake to establish it")
     extra = {
-        "hold_handshake": (
-            C.RSI_PROGRAM_RUNNING and C.JETSON_RSI_SOCKET_BOUND,
-            [b for b in (
-                None if C.RSI_PROGRAM_RUNNING else
-                f"controller-side RSI program not running (tcp/{C.PORT_EXT_TRIGGER_TCP} closed)",
-                None if C.JETSON_RSI_SOCKET_BOUND else
-                f"Jetson udp/{C.PORT_RSI_UDP} socket unbound") if b]),
+        "hold_handshake": (not hold_blockers, hold_blockers),
         "supervised_student_prefix": (
             False, ["CLI-to-RSI execution requires an operator arming action "
                     "and a live HOLD handshake first"]),
         "astra_direct": (cart_ok, cart_why),
     }
     rep = dc.report(cfg, extra_gates=extra)
-    rep["cell_state"] = {"ext_trigger_open": C.EXT_TRIGGER_OPEN,
-                         "rsi_program_running": C.RSI_PROGRAM_RUNNING,
-                         "rsi_socket_bound": C.JETSON_RSI_SOCKET_BOUND}
+    rep["cell_state_live"] = rt
+    rep["cell_state_baseline"] = {
+        "ext_trigger_open": C.BASELINE_EXT_TRIGGER_OPEN,
+        "rsi_program_running": C.BASELINE_RSI_PROGRAM_RUNNING,
+        "rsi_socket_bound": C.BASELINE_JETSON_RSI_SOCKET_BOUND,
+        "note": C.BASELINE_NOTE}
     rep["locked_modes"] = I.modes_locked()
     if args.json:
         print(_json.dumps(rep, indent=1))
@@ -233,6 +256,95 @@ def cmd_gonogo(args: argparse.Namespace) -> int:
         if len(d["blockers"]) > 6:
             print(f"      ... and {len(d['blockers']) - 6} more")
     return 0
+
+
+
+def cmd_hold(args: argparse.Namespace) -> int:
+    """HOLD handshake: bind udp/59152, answer every frame, command NOTHING.
+
+    This is the only safe way to prove the RSI program is running, and the
+    reason is the protocol itself: the controller expects a reply within 4 ms,
+    so a passive listener that binds and stays silent FAULTS IT. Checking by
+    "just listening" is not a lighter-touch version of this -- it is worse.
+
+    HOLD answers every frame with the pose the arm is already at and
+    STOPFLAG=1. It keeps the session alive and moves nothing.
+    """
+    import socket as _s
+    from . import cell as C
+    from .execution import ExecutionController, ProtocolAdapter, State
+
+    if not args.bind:
+        print("REFUSED: binding udp/%d is an action on the robot network.\n"
+              "  Pass --bind to do it. Before you do, understand that this "
+              "process MUST keep answering:\n"
+              "  a silent listener on this port faults the controller."
+              % C.PORT_RSI_UDP, file=sys.stderr)
+        return 2
+
+    class UdpTransport:
+        def __init__(self, host, port, timeout):
+            self.sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+            self.sock.bind((host, port))
+            self.sock.settimeout(timeout)
+
+        def receive(self, timeout_s):
+            try:
+                return self.sock.recvfrom(4096)
+            except (TimeoutError, OSError):
+                return None
+
+        def send(self, payload, peer):
+            self.sock.sendto(payload, peer)
+
+        def close(self):
+            self.sock.close()
+
+    print(f"HOLD handshake on {args.host}:{C.PORT_RSI_UDP}")
+    print("  motion: DISABLED. Every reply carries the measured pose and "
+          "STOPFLAG=1.")
+    print(f"  waiting up to {args.wait:.0f}s for the controller to connect ...\n")
+    tr = UdpTransport(args.host, C.PORT_RSI_UDP, args.timeout)
+    ctrl = ExecutionController(ProtocolAdapter(tr), allow_motion=False)
+    ctrl.open_session()
+    t0 = time.time()
+    first = None
+    try:
+        while len(ctrl.outcomes) < args.frames:
+            out = ctrl.serve_cycle(timeout_s=args.timeout)
+            if out is None:
+                if first is None and time.time() - t0 > args.wait:
+                    print("  NO FRAMES RECEIVED.", file=sys.stderr)
+                    print("  The RSI program is not running, or it is not "
+                          "pointed at this host.", file=sys.stderr)
+                    print(f"  Start it via the trigger on "
+                          f"tcp/{C.PORT_EXT_TRIGGER_TCP}, then retry.",
+                          file=sys.stderr)
+                    return 2
+                continue
+            if first is None:
+                first = out
+                print(f"  RSI IS RUNNING -- first frame IPOC={out.ipoc}")
+                print(f"  measured joints: "
+                      f"{[round(v, 2) for v in (out.measured or [])]}")
+            if len(ctrl.outcomes) % 250 == 0:
+                print(f"  {len(ctrl.outcomes)} frames answered ...")
+    except KeyboardInterrupt:
+        print("\n  interrupted")
+    finally:
+        a = ctrl.adapter
+        dt = time.time() - t0
+        print(f"\n  frames in/out   : {a.frames_in} / {a.frames_out}")
+        print(f"  malformed       : {a.malformed}")
+        print(f"  IPOC regressions: {a.ipoc_regressions}   jumps: {a.ipoc_jumps}")
+        print(f"  elapsed         : {dt:.2f}s "
+              f"({a.frames_in / dt if dt else 0:.0f} Hz observed)")
+        print(f"  state           : {ctrl.state.value}")
+        tr.close()
+    ok = (a.frames_in > 0 and a.frames_in == a.frames_out
+          and a.ipoc_regressions == 0 and a.malformed == 0)
+    print(f"\n  HOLD handshake: {'CLEAN' if ok else 'PROBLEMS -- see counters'}")
+    return 0 if ok else 1
 
 
 def cmd_phase1(args: argparse.Namespace) -> int:
@@ -481,6 +593,15 @@ def main(argv=None) -> int:
     rn.add_argument("--audit"); rn.add_argument("--serial")
     rn.set_defaults(func=cmd_run)
 
+    hd = sub.add_parser("hold", help="HOLD handshake: prove RSI is running, move nothing")
+    hd.add_argument("--host", default="172.17.255.2")
+    hd.add_argument("--frames", type=int, default=2500, help="~10s at 250 Hz")
+    hd.add_argument("--wait", type=float, default=10.0)
+    hd.add_argument("--timeout", type=float, default=0.05)
+    hd.add_argument("--bind", action="store_true",
+                    help="REQUIRED. Binds udp/59152 and answers every frame.")
+    hd.set_defaults(func=cmd_hold)
+
     mz = sub.add_parser("measure", help="guided collection of measured cell values")
     mz.add_argument("--out", default="deployment_config.json")
     mz.add_argument("--cell", default="dishwasher_table")
@@ -494,6 +615,9 @@ def main(argv=None) -> int:
     gg = sub.add_parser("gonogo", help="machine-readable GO/NO-GO report")
     gg.add_argument("--config", default="deployment_config.json")
     gg.add_argument("--json", action="store_true")
+    gg.add_argument("--probe-network", action="store_true",
+                    help="observe the controller trigger port (read-only "
+                         "connect; opens nothing). Run this on the Jetson.")
     gg.set_defaults(func=cmd_gonogo)
 
     p3 = sub.add_parser("phase3")

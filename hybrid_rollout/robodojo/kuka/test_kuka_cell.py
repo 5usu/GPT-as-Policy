@@ -191,3 +191,48 @@ class TestKnownAbsent:
 
     def test_output_path_absence_is_explicit(self):
         assert any("CLI-to-RSI output path" in a for a in cell.KNOWN_ABSENT)
+
+
+class TestBaselineIsNotAGate:
+    """The baseline was recorded WITH RSI OFF. Using it as current state would
+    permanently report 'not running' even after the engineer starts it."""
+
+    def test_baseline_is_labelled_as_taken_with_rsi_off(self):
+        assert cell.BASELINE_TAKEN_WITH_RSI_OFF is True
+        assert "NOT a permanent property" in cell.BASELINE_NOTE
+
+    def test_runtime_probe_is_separate_from_baseline(self):
+        rt = cell.probe_runtime()
+        assert "jetson_rsi_socket_bound" in rt
+        assert rt["baseline_was_taken_with_rsi_off"] is True
+
+    def test_probe_does_not_touch_the_network_by_default(self):
+        rt = cell.probe_runtime()
+        assert rt["allow_network"] is False
+        assert rt["ext_trigger_open"] is None, "unknown, not assumed from baseline"
+        assert rt["rsi_program_running"] is None
+
+    def test_unknown_is_reported_as_unknown_not_as_false(self):
+        """The distinction that matters: `None` means we did not look."""
+        rt = cell.probe_runtime()
+        assert rt["ext_trigger_open"] is not False
+
+    def test_program_running_is_never_inferred_from_the_trigger_port(self):
+        """A listening iicoServer is not proof the RSI loop is running."""
+        rt = cell.probe_runtime(allow_network=False)
+        assert rt["rsi_program_running"] is None
+        assert "Rob frame" in cell.probe_runtime(allow_network=False).get("note", "") \
+            or "not requested" in rt["note"]
+
+    def test_static_config_facts_survive_rsi_being_off(self):
+        """The RSI element set comes from configuration, not from a live probe,
+        so it is true whether or not the program is running."""
+        from . import interfaces as I
+        assert I.RSI_HAS_RKORR is False
+        assert set(I.RSI_ACCEPTED_ELEMENTS) == {
+            "AK.A1", "AK.A2", "AK.A3", "AK.A4", "AK.A5", "AK.A6", "STOPFLAG"}
+
+    def test_verify_marks_the_baseline_as_non_authoritative(self):
+        names = {c.name: c for c in cell.verify()}
+        assert "baseline_is_not_a_gate" in names
+        assert names["baseline_is_not_a_gate"].passed is None

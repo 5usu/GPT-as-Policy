@@ -72,8 +72,14 @@ class TestToolCenterPoint:
 
 
 class TestExecutionLocks:
-    def test_only_student_may_be_emitted(self):
-        assert EXECUTABLE_DECISION_MODES == frozenset({"student"})
+    def test_emittable_modes_are_joint_space_only(self):
+        """Both reach the controller over AK.A1..A6. Cartesian cannot."""
+        assert EXECUTABLE_DECISION_MODES == frozenset(
+            {"student", "astra_direct_joint"})
+
+    def test_no_cartesian_mode_is_emittable(self):
+        assert "eef" not in EXECUTABLE_DECISION_MODES
+        assert "astra_direct" not in EXECUTABLE_DECISION_MODES
 
     def test_edit_execution_is_off(self):
         assert EDIT_EXECUTION_ENABLED is False

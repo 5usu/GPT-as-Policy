@@ -65,7 +65,12 @@ class Stage(str, Enum):
 #: campaign has validated it. Only a bounded STUDENT PREFIX of pi0.5 joint
 #: actions may execute for now. `eef` and Astra-direct are blocked by the
 #: interface itself and cannot be enabled by configuration here.
-EXECUTABLE_DECISION_MODES = frozenset({"student"})
+#: `astra_direct_joint` is executable in principle -- this controller accepts
+#: AK.A1..A6, so a self-proposed joint action is deliverable. It is NOT enabled
+#: by default: `ReviewLoop(direct_bounds=...)` must be given validated bounds,
+#: and every other gate still applies. Cartesian `eef`/`astra_direct` remain
+#: blocked by the interface and no configuration here changes that.
+EXECUTABLE_DECISION_MODES = frozenset({"student", "astra_direct_joint"})
 EDIT_EXECUTION_ENABLED = False
 EDIT_LOCK_REASON = (
     "joint edits are deliverable over AK.A1-A6, but execution of a reviewer "
@@ -216,7 +221,8 @@ class KukaReviewLoop:
                  ledger: CommandLedger | None = None,
                  secret: bytes | None = None,
                  hz: float = CONTROL_HZ,
-                 cartesian: CartesianCapability | None = None) -> None:
+                 cartesian: CartesianCapability | None = None,
+                 direct_bounds: Any = None) -> None:
         self.mode = mode
         self.config = dict(config)
         self.raw_config = dict(raw_config or {})
@@ -232,6 +238,7 @@ class KukaReviewLoop:
         self.secret = secret
         self.hz = hz
         self.cartesian = cartesian or CartesianCapability()
+        self.direct_bounds = direct_bounds
         self.cycle = 0
         self.retries = 0
         self.no_progress = 0
@@ -386,6 +393,29 @@ class KukaReviewLoop:
                     else "target rejected: " + ", ".join(v_codes))
                 return self._finish(rec, Stage.DECIDE, Outcome.EEF_REFUSED, detail)
 
+        if dmode == "astra_direct_joint":
+            from .astra_direct import direct_eligible, validate_direct
+            rows_d = decision.get("joint_targets_deg") or []
+            if self.direct_bounds is None:
+                return self._finish(
+                    rec, Stage.DECIDE, Outcome.GATE_BLOCKED,
+                    "astra_direct_joint proposed but no validated bounds were "
+                    "supplied. Direct proposal removes the policy's sanity floor, "
+                    "so bounds are required, not optional.")
+            viol = validate_direct(rows_d, measured=state, bounds=self.direct_bounds)
+            ok_d, codes = direct_eligible(viol)
+            rec.decision = {**decision, "direct_gate": {
+                "bounds": self.direct_bounds.to_log(),
+                "violations": [x.to_log() for x in viol],
+                "accepted": ok_d}}
+            if not ok_d:
+                return self._finish(rec, Stage.DECIDE, Outcome.GATE_BLOCKED,
+                                    f"astra_direct_joint rejected: {', '.join(codes)}")
+            candidate = [list(r) + [state[ARM_DIM]] if len(r) == ARM_DIM else list(r)
+                         for r in rows_d]
+            outcome = Outcome.APPLIED_EDIT
+            rec.improvement_valid = True
+
         if dmode == "edit":
             edit = decision.get("edit") or {}
             deltas = edit.get("delta_joint_deg")
@@ -463,7 +493,8 @@ class KukaReviewLoop:
         # and that prefix is exactly what this build permits. Gating on the
         # reviewer's requested mode would block a fallback that is already the
         # permitted thing -- the question is what leaves this function.
-        emit_mode = "edit" if outcome is Outcome.APPLIED_EDIT else "student"
+        emit_mode = ("astra_direct_joint" if dmode == "astra_direct_joint"
+                     else "edit" if outcome is Outcome.APPLIED_EDIT else "student")
         rec.emitted_mode = emit_mode
         if emit_mode not in EXECUTABLE_DECISION_MODES:
             locked = modes_locked().get(emit_mode, "not executable in this build")
