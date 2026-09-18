@@ -365,8 +365,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     missing = [f"{s.observation_id}/{cam}" for s in samples
                for cam, f in s.frames.items() if not f.get("frame_present")]
     if missing:
-        print(f"  REFUSED: pi0.5 needs the camera frames and {len(missing)} are not "
-              f"extracted (e.g. {missing[0]}). Pass --media-root and extract "
+        print(f"  REFUSED: the reviewer judges the chunk against the frames it was "
+              f"proposed from, and {len(missing)} are not extracted "
+              f"(e.g. {missing[0]}). Pass --media-root and extract "
               f"<media_root>/frames/<camera>_<frame:06d>.png first.", file=sys.stderr)
         return 2
     fk = make_fk()
