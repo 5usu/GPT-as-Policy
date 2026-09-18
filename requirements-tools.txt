@@ -11,3 +11,6 @@ msgpack
 PyYAML
 omegaconf
 pytest
+# Trajectory generation for the deployment path. Not optional: otg.py refuses to
+# substitute another profile, so without it the execution tests cannot run.
+ruckig
