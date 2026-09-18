@@ -336,7 +336,8 @@ class KukaReviewLoop:
         rec.review = {"source": getattr(self.review_source, "name", "?"),
                       "is_live": bool(getattr(self.review_source, "is_live", False)),
                       "ok": bool(rv.get("ok")), "error": rv.get("error"),
-                      "dry_run": bool(rv.get("dry_run")), "usage": rv.get("usage")}
+                      "dry_run": bool(rv.get("dry_run")), "usage": rv.get("usage"),
+                      "attempts_used": rv.get("attempts_used")}
         if not rv.get("ok"):
             return self._finish(rec, Stage.REVIEW, Outcome.NO_DECISION,
                                 str(rv.get("error", "review failed")))

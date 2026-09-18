@@ -375,3 +375,17 @@ class TestReviewPacketReachesTheReviewer:
         a = AstraReviewSource(base_url="https://x", model="m", api_key_env="NOPE")
         r = a.review({"request_id": "o", "mode": "live_shadow"})
         assert r["ok"] is False and "packet" in r["error"]
+
+    def test_audit_records_how_many_attempts_the_review_cost(self, tmp_path):
+        """Each attempt is billable, so the row must say how many there were."""
+        class _Retried(self._Capture):
+            def review(self, packet):
+                r = super().review(packet)
+                return {**r, "attempts_used": 3, "usage": {"total_tokens": 42}}
+        log = AuditLog(tmp_path / "a.jsonl")
+        lp = loop(Mode.LIVE_SHADOW, audit=log)
+        lp.review_source = _Retried()
+        lp.step(self.obs())
+        row = json.loads(log.path.read_text().splitlines()[0])
+        assert row["review"]["attempts_used"] == 3
+        assert row["review"]["usage"]["total_tokens"] == 42

@@ -350,9 +350,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     review = AstraReviewSource(
         base_url=args.astra_url, model=args.astra_model,
         api_key_env=args.astra_key_env, enabled=args.astra_live,
-        dry_run=not args.astra_live, reasoning=args.astra_effort)
+        dry_run=not args.astra_live, reasoning=args.astra_effort,
+        stream=not args.astra_no_stream, attempts=args.astra_attempts)
     ok, why = review.preflight()
-    print(f"  astra        : {'LIVE (PAID)' if args.astra_live else 'DRY RUN'} -- {why}")
+    print(f"  astra        : {'LIVE (PAID)' if args.astra_live else 'DRY RUN'} -- {why}"
+          f" [{'streamed' if review.stream else 'single response'}]")
     if args.astra_live and not ok:
         print(f"  REFUSED: {why}", file=sys.stderr)
         return 2
@@ -467,6 +469,14 @@ def main(argv=None) -> int:
     rn.add_argument("--astra-effort", default="low")
     rn.add_argument("--astra-live", action="store_true",
                     help="MAKE PAID API CALLS. Off by default.")
+    rn.add_argument("--astra-attempts", type=int, default=1,
+                    help="how many times ONE review may be attempted when the "
+                         "CONNECTION fails (default 1). An answered review is "
+                         "never re-asked. Each attempt is billable.")
+    rn.add_argument("--astra-no-stream", action="store_true",
+                    help="do not stream the review. Still one attempt, but an "
+                         "outbound proxy that closes idle tunnels (the Jetson's "
+                         "does, at ~108s) will lose long reviews.")
     rn.add_argument("--audit"); rn.add_argument("--serial")
     rn.set_defaults(func=cmd_run)
 

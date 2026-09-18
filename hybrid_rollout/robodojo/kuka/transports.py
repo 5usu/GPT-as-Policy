@@ -269,7 +269,8 @@ class AstraReviewSource:
     def __init__(self, *, base_url: str, model: str, api_key_env: str,
                  enabled: bool = False, dry_run: bool = True,
                  reasoning: str | None = None, store: bool = False,
-                 timeout: float = 180.0, transport=None) -> None:
+                 timeout: float = 180.0, transport=None,
+                 stream: bool = False, attempts: int = 1) -> None:
         self.base_url = base_url
         self.model = model
         self.api_key_env = api_key_env
@@ -279,6 +280,16 @@ class AstraReviewSource:
         self.store = store
         self.timeout = timeout
         self.transport = transport
+        # Streaming is still ONE attempt; it only keeps bytes moving while the
+        # model reasons. Measured on the Jetson: the outbound proxy closes an
+        # idle tunnel at ~108 s and a review takes ~130 s, so a non-streaming
+        # call loses the answer it already paid for.
+        self.stream = bool(stream)
+        # A retry here is for a connection that DIED, never for an answer we do
+        # not like: once a response is parsed it is the decision, including a
+        # `stop` and including unparseable prose. Re-asking an answered review
+        # would be shopping for a verdict. Default 1 = the original behaviour.
+        self.attempts = max(1, int(attempts))
 
     def preflight(self) -> tuple[bool, str]:
         if not self.enabled:
@@ -311,6 +322,8 @@ class AstraReviewSource:
         except KeyError as exc:
             return {"ok": False, "error": f"review packet is missing {exc}; build it "
                                           "with packet.build_packet"}
+        if self.stream:
+            body = {**body, "stream": True}
         digest = _h.sha256(_json.dumps(body, sort_keys=True).encode()).hexdigest()[:12]
         if self.dry_run:
             return {"ok": False, "dry_run": True, "body_sha256_12": digest,
@@ -320,25 +333,31 @@ class AstraReviewSource:
         ok, why = self.preflight()
         if not ok:
             return {"ok": False, "error": why, "body_sha256_12": digest}
-        try:
-            raw = (self.transport or _urllib_post)(
-                self.base_url, body,
-                {"Authorization": f"Bearer {os.environ[self.api_key_env]}",
-                 "Content-Type": "application/json"}, self.timeout)
-        except Exception as exc:                               # noqa: BLE001
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300],
-                    "body_sha256_12": digest}
+        poster = self.transport or (_urllib_post_stream if self.stream else _urllib_post)
+        headers = {"Authorization": f"Bearer {os.environ[self.api_key_env]}",
+                   "Content-Type": "application/json"}
+        used = 0
+        for used in range(1, self.attempts + 1):
+            try:
+                raw = poster(self.base_url, body, headers, self.timeout)
+                break
+            except Exception as exc:                           # noqa: BLE001
+                if used >= self.attempts:
+                    return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300],
+                            "body_sha256_12": digest, "attempts_used": used}
         text, usage = _extract_text(raw)
         if text is None:
             return {"ok": False, "error": "no text in response", "usage": usage,
-                    "body_sha256_12": digest}
+                    "body_sha256_12": digest, "attempts_used": used}
         try:
             decision = _json.loads(text)
         except Exception:
             return {"ok": False, "error": "response was not valid JSON",
-                    "raw_text": text[:2000], "body_sha256_12": digest}
+                    "raw_text": text[:2000], "body_sha256_12": digest,
+                    "attempts_used": used}
         return {"ok": True, "decision": decision, "usage": usage,
-                "source": self.name, "is_live": True, "body_sha256_12": digest}
+                "source": self.name, "is_live": True, "body_sha256_12": digest,
+                "attempts_used": used}
 
 
 def _urllib_post(url: str, body: dict, headers: dict, timeout: float) -> dict:
@@ -358,6 +377,59 @@ def _urllib_post(url: str, body: dict, headers: dict, timeout: float) -> dict:
         except Exception:
             pass
         raise RuntimeError(f"HTTP {e.code} {e.reason}: {detail}") from None
+
+
+def _final_from_sse(lines) -> dict:
+    """The final response object out of a Responses SSE stream.
+
+    Deltas, keep-alives and unparseable lines are ignored: the terminal
+    `response.completed` (or `.incomplete`/`.failed`) event carries the whole
+    response, so nothing has to be reassembled from fragments. An interrupted
+    stream yields {}, which the caller reports as a failure rather than a
+    partial decision.
+    """
+    import json as _json
+    final: dict = {}
+    for raw in lines:
+        line = raw.decode() if isinstance(raw, bytes) else raw
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            event = _json.loads(payload)
+        except ValueError:
+            continue
+        if str(event.get("type", "")).startswith(("response.completed",
+                                                  "response.incomplete",
+                                                  "response.failed")):
+            final = event.get("response") or {}
+    return final
+
+
+def _urllib_post_stream(url: str, body: dict, headers: dict, timeout: float) -> dict:
+    """One attempt, streamed. Same contract as _urllib_post: no retries, no
+    fallback model. `timeout` is per read, so a long review no longer trips it."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, data=_json.dumps(body).encode(),
+                                 headers={**headers, "Accept": "text/event-stream"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            final = _final_from_sse(r)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:1500]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code} {e.reason}: {detail}") from None
+    if not final:
+        raise RuntimeError("stream ended without a completed response event")
+    return final
 
 
 def _extract_text(raw: Any) -> tuple[str | None, dict | None]:

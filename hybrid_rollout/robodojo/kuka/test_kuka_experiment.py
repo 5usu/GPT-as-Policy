@@ -245,3 +245,103 @@ class TestLiveSourcesAreOffByDefault:
         import importlib
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module("hybrid_rollout.robodojo.kuka.pi05_serve")
+
+class TestStreamingSurvivesALongReview:
+    """PROPERTY: a review that takes longer than the proxy's idle timeout still
+    completes. Measured on the Jetson: a non-streaming call is cut at ~108 s by
+    the outbound proxy while gpt-6-astra needs ~130 s, so the answer never
+    arrives; a streamed call keeps bytes flowing and returns."""
+
+    def sse(self, response):
+        import json as _json
+        return [b"event: response.output_text.delta\n",
+                b'data: {"type": "response.output_text.delta", "delta": "{"}\n',
+                b"\n",
+                b"event: response.completed\n",
+                ('data: ' + _json.dumps({"type": "response.completed",
+                                         "response": response})).encode() + b"\n",
+                b"data: [DONE]\n"]
+
+    def test_final_response_is_taken_from_the_completed_event(self):
+        from .transports import _final_from_sse
+        want = {"output_text": '{"mode": "student"}', "usage": {"input_tokens": 7}}
+        assert _final_from_sse(self.sse(want)) == want
+
+    def test_deltas_and_junk_lines_are_ignored(self):
+        from .transports import _final_from_sse
+        lines = [b": keep-alive\n", b"\n", b"data: not json\n"] + self.sse({"output_text": "x"})
+        assert _final_from_sse(lines) == {"output_text": "x"}
+
+    def test_an_unfinished_stream_yields_no_response(self):
+        from .transports import _final_from_sse
+        assert _final_from_sse([b'data: {"type": "response.output_text.delta"}\n']) == {}
+
+    def test_streaming_is_declared_in_the_hashed_body(self, monkeypatch):
+        from .transports import AstraReviewSource
+        monkeypatch.setenv("FAKE_KEY", "not-a-real-key")
+        pkt = build_packet(task_instruction="t", observation_id="o", state=[0.0] * 7,
+                           chunk=[[0.0] * 7], provenance="model_predicted", frames={})
+        sent = []
+        a = AstraReviewSource(base_url="https://x", model="m", api_key_env="FAKE_KEY",
+                              enabled=True, dry_run=False, stream=True,
+                              transport=lambda url, body, headers, timeout: sent.append(body) or {})
+        a.review(pkt)
+        assert sent and sent[0]["stream"] is True, "what is sent must be what is hashed"
+
+
+class TestBoundedTransportRetry:
+    """PROPERTY: retries are for a connection that died, never for an answer we
+    dislike. A decision that arrived is final, however it reads."""
+
+    def pkt(self):
+        return build_packet(task_instruction="t", observation_id="o", state=[0.0] * 7,
+                            chunk=[[0.0] * 7], provenance="model_predicted", frames={})
+
+    def source(self, transport, attempts, monkeypatch):
+        from .transports import AstraReviewSource
+        monkeypatch.setenv("FAKE_KEY", "not-a-real-key")
+        return AstraReviewSource(base_url="https://x", model="m", api_key_env="FAKE_KEY",
+                                 enabled=True, dry_run=False, attempts=attempts,
+                                 transport=transport)
+
+    def test_default_is_still_a_single_attempt(self, monkeypatch):
+        calls = []
+
+        def boom(*a):
+            calls.append(1)
+            raise RuntimeError("connection reset")
+        r = self.source(boom, 1, monkeypatch).review(self.pkt())
+        assert len(calls) == 1 and r["ok"] is False
+
+    def test_a_dead_connection_is_retried_up_to_the_bound(self, monkeypatch):
+        calls = []
+
+        def flaky(*a):
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("stream ended without a completed response event")
+            return {"output_text": '{"mode": "stop", "reason": "unsafe"}',
+                    "usage": {"total_tokens": 5}}
+        r = self.source(flaky, 3, monkeypatch).review(self.pkt())
+        assert len(calls) == 3
+        assert r["ok"] is True and r["decision"]["mode"] == "stop"
+        assert r["attempts_used"] == 3
+
+    def test_an_answered_review_is_never_retried(self, monkeypatch):
+        calls = []
+
+        def stopper(*a):
+            calls.append(1)
+            return {"output_text": '{"mode": "stop", "reason": "the scene is unsafe"}'}
+        r = self.source(stopper, 3, monkeypatch).review(self.pkt())
+        assert len(calls) == 1, "a decision must never be re-asked"
+        assert r["decision"]["mode"] == "stop"
+
+    def test_a_non_json_answer_is_not_retried_either(self, monkeypatch):
+        calls = []
+
+        def prose(*a):
+            calls.append(1)
+            return {"output_text": "I think you should stop"}
+        r = self.source(prose, 3, monkeypatch).review(self.pkt())
+        assert len(calls) == 1 and r["ok"] is False
