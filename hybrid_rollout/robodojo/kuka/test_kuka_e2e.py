@@ -278,7 +278,20 @@ class TestFailureScenarios:
     def test_9_requested_edit_is_recorded_but_not_emitted(self):
         from .loop import EDIT_EXECUTION_ENABLED, EXECUTABLE_DECISION_MODES
         assert EDIT_EXECUTION_ENABLED is False
-        assert EXECUTABLE_DECISION_MODES == frozenset({"student"})
+        assert "edit" not in EXECUTABLE_DECISION_MODES
+
+    def test_9b_cartesian_stays_blocked_by_the_interface(self):
+        """Adding a joint-space direct mode must not have opened Cartesian."""
+        from .interfaces import cartesian_capability
+        from .loop import EXECUTABLE_DECISION_MODES
+        assert cartesian_capability()[0] is False
+        assert "eef" not in EXECUTABLE_DECISION_MODES
+        assert "astra_direct" not in EXECUTABLE_DECISION_MODES
+
+    def test_9c_joint_direct_still_needs_its_bounds(self):
+        from .astra_direct import DirectBounds, DirectBoundsMissing
+        with pytest.raises(DirectBoundsMissing):
+            DirectBounds.from_config({})
 
     def test_10_process_error_lands_in_hold_still_answering(self):
         t = FakeTransport()

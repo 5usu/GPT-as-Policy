@@ -83,7 +83,21 @@ FIELDS: dict[str, tuple[str, str, str]] = {
                                    "a contact-rich task needs a force ceiling"),
     "gripper_safe_action": ("devices", "what the gripper does on arm HOLD/FAULT/E-stop",
                             "an arm stop does NOT stop a Modbus gripper"),
-    # --- astra-direct only --------------------------------------------------
+    # --- astra-direct, JOINT space (this cell's controller takes AK.A1..A6) --
+    "direct_max_step_deg": ("astra_direct_joint",
+                            "per-joint max change between consecutive proposed points",
+                            "the only per-step bound once pi0.5 is out of the loop"),
+    "direct_max_total_excursion_deg": ("astra_direct_joint",
+                                       "per-joint max distance from the MEASURED pose",
+                                       "stops a run of small steps walking somewhere far"),
+    "direct_max_steps": ("astra_direct_joint", "max proposed points per decision",
+                         "bounds how much is committed on one judgement"),
+    "direct_authorised_by": ("astra_direct_joint", "named human who authorised it",
+                             "accountability for removing the policy's sanity floor"),
+    "direct_shadow_campaign": ("astra_direct_joint",
+                               "reference to a completed shadow campaign on this task",
+                               "evidence before authority"),
+    # --- astra-direct, CARTESIAN (upstream's form; blocked by the interface) -
     "astra_direct_authorised_by": ("astra_direct", "named human", "accountability"),
     "astra_direct_bounded_action_space": ("astra_direct", "explicit bounds",
                                           "an unbounded self-proposal is the thing to prevent"),
@@ -98,7 +112,13 @@ GATE_SETS = {
     "shadow_review": ("camera_device_mapping",),
     "hold_handshake": (),
     "supervised_student_prefix": tuple(
+        k for k, (sec, _, _) in FIELDS.items()
+        if sec not in ("astra_direct", "astra_direct_joint")),
+    # Joint-space direct: everything the supervised prefix needs, PLUS its own
+    # bounds. Reachable through this controller.
+    "astra_direct_joint": tuple(
         k for k, (sec, _, _) in FIELDS.items() if sec != "astra_direct"),
+    # Cartesian direct: upstream's form. Blocked by the RSI receive config.
     "astra_direct": tuple(FIELDS),
 }
 
