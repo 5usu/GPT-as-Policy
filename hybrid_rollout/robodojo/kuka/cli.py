@@ -257,6 +257,95 @@ def cmd_gonogo(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_hold(args: argparse.Namespace) -> int:
+    """HOLD handshake: bind udp/59152, answer every frame, command NOTHING.
+
+    This is the only safe way to prove the RSI program is running, and the
+    reason is the protocol itself: the controller expects a reply within 4 ms,
+    so a passive listener that binds and stays silent FAULTS IT. Checking by
+    "just listening" is not a lighter-touch version of this -- it is worse.
+
+    HOLD answers every frame with the pose the arm is already at and
+    STOPFLAG=1. It keeps the session alive and moves nothing.
+    """
+    import socket as _s
+    from . import cell as C
+    from .execution import ExecutionController, ProtocolAdapter, State
+
+    if not args.bind:
+        print("REFUSED: binding udp/%d is an action on the robot network.\n"
+              "  Pass --bind to do it. Before you do, understand that this "
+              "process MUST keep answering:\n"
+              "  a silent listener on this port faults the controller."
+              % C.PORT_RSI_UDP, file=sys.stderr)
+        return 2
+
+    class UdpTransport:
+        def __init__(self, host, port, timeout):
+            self.sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+            self.sock.bind((host, port))
+            self.sock.settimeout(timeout)
+
+        def receive(self, timeout_s):
+            try:
+                return self.sock.recvfrom(4096)
+            except (TimeoutError, OSError):
+                return None
+
+        def send(self, payload, peer):
+            self.sock.sendto(payload, peer)
+
+        def close(self):
+            self.sock.close()
+
+    print(f"HOLD handshake on {args.host}:{C.PORT_RSI_UDP}")
+    print("  motion: DISABLED. Every reply carries the measured pose and "
+          "STOPFLAG=1.")
+    print(f"  waiting up to {args.wait:.0f}s for the controller to connect ...\n")
+    tr = UdpTransport(args.host, C.PORT_RSI_UDP, args.timeout)
+    ctrl = ExecutionController(ProtocolAdapter(tr), allow_motion=False)
+    ctrl.open_session()
+    t0 = time.time()
+    first = None
+    try:
+        while len(ctrl.outcomes) < args.frames:
+            out = ctrl.serve_cycle(timeout_s=args.timeout)
+            if out is None:
+                if first is None and time.time() - t0 > args.wait:
+                    print("  NO FRAMES RECEIVED.", file=sys.stderr)
+                    print("  The RSI program is not running, or it is not "
+                          "pointed at this host.", file=sys.stderr)
+                    print(f"  Start it via the trigger on "
+                          f"tcp/{C.PORT_EXT_TRIGGER_TCP}, then retry.",
+                          file=sys.stderr)
+                    return 2
+                continue
+            if first is None:
+                first = out
+                print(f"  RSI IS RUNNING -- first frame IPOC={out.ipoc}")
+                print(f"  measured joints: "
+                      f"{[round(v, 2) for v in (out.measured or [])]}")
+            if len(ctrl.outcomes) % 250 == 0:
+                print(f"  {len(ctrl.outcomes)} frames answered ...")
+    except KeyboardInterrupt:
+        print("\n  interrupted")
+    finally:
+        a = ctrl.adapter
+        dt = time.time() - t0
+        print(f"\n  frames in/out   : {a.frames_in} / {a.frames_out}")
+        print(f"  malformed       : {a.malformed}")
+        print(f"  IPOC regressions: {a.ipoc_regressions}   jumps: {a.ipoc_jumps}")
+        print(f"  elapsed         : {dt:.2f}s "
+              f"({a.frames_in / dt if dt else 0:.0f} Hz observed)")
+        print(f"  state           : {ctrl.state.value}")
+        tr.close()
+    ok = (a.frames_in > 0 and a.frames_in == a.frames_out
+          and a.ipoc_regressions == 0 and a.malformed == 0)
+    print(f"\n  HOLD handshake: {'CLEAN' if ok else 'PROBLEMS -- see counters'}")
+    return 0 if ok else 1
+
+
 def cmd_phase1(args: argparse.Namespace) -> int:
     """Show Astra a recorded trajectory + the matching observation frames."""
     cfg = load_config(args.experiment)
@@ -468,6 +557,15 @@ def main(argv=None) -> int:
                     help="MAKE PAID API CALLS. Off by default.")
     rn.add_argument("--audit"); rn.add_argument("--serial")
     rn.set_defaults(func=cmd_run)
+
+    hd = sub.add_parser("hold", help="HOLD handshake: prove RSI is running, move nothing")
+    hd.add_argument("--host", default="172.17.255.2")
+    hd.add_argument("--frames", type=int, default=2500, help="~10s at 250 Hz")
+    hd.add_argument("--wait", type=float, default=10.0)
+    hd.add_argument("--timeout", type=float, default=0.05)
+    hd.add_argument("--bind", action="store_true",
+                    help="REQUIRED. Binds udp/59152 and answers every frame.")
+    hd.set_defaults(func=cmd_hold)
 
     mz = sub.add_parser("measure", help="guided collection of measured cell values")
     mz.add_argument("--out", default="deployment_config.json")
