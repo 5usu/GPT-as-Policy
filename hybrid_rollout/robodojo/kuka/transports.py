@@ -177,71 +177,79 @@ class BoundedAstraProposalSource:
                 "is_live": False, "provenance": self.provenance}
 
 
-class Pi05HttpProposalSource:
-    """LIVE pi0.5 proposals from the A800 inference server.
+class LocalPi05ProposalSource:
+    """pi0.5 proposals from a LOCAL model the operator already runs.
 
-    is_live is True, and that flag propagates into every audit row: a run driven
-    by the real checkpoint must never be indistinguishable from a replay.
+    Replaces the HTTP serving layer that used to live here. The deployment
+    engineer has the checkpoint on their own machine, so this package should not
+    prescribe how it is served -- it takes a callable, or pre-computed chunks
+    from a file, and stays out of the way.
 
-    The server is expected to be reachable ONLY from the A800/eng-1 side. The
-    Jetson does not call it directly in the staged rollout -- proposals are
-    fetched, reviewed, gated and only then does anything reach the robot host.
+    `infer` receives the observation dict and must return a list of 50 rows of 7
+    absolute joint targets in degrees. Anything else is refused.
+
+    THE CHECKPOINT CONTRACT IS STILL ENFORCED. `meta` must report
+    use_relative_actions=True. The eight finetunes under oss://i-robot-data/models/
+    look correct in every other respect and are a different training run; loading
+    one does not crash, it silently returns targets in the wrong space.
     """
 
-    name = "pi05_live"
+    name = "pi05_local"
     is_live = True
     provenance = "model_predicted"
 
-    def __init__(self, base_url: str, *, checkpoint_id: str | None = None,
-                 expected_sha256: str | None = None, timeout: float = 120.0,
-                 transport=None) -> None:
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, infer=None, *, chunks: dict[str, list[list[float]]] | None = None,
+                 checkpoint_id: str | None = None,
+                 meta: dict[str, Any] | None = None,
+                 expected_steps: int = 50, expected_dims: int = 7) -> None:
+        if infer is None and chunks is None:
+            raise ValueError("supply either infer= (a callable) or chunks= (precomputed)")
+        self.infer = infer
+        self.chunks = dict(chunks or {})
         self.checkpoint_id = checkpoint_id
-        self.expected_sha256 = expected_sha256
-        self.timeout = timeout
-        self.transport = transport      # injectable for tests; no network by default
+        self.meta = dict(meta or {})
+        self.expected_steps = expected_steps
+        self.expected_dims = expected_dims
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.transport is not None:
-            return self.transport(self.base_url + path, payload, self.timeout)
+    @classmethod
+    def from_file(cls, path: str, **kw) -> "LocalPi05ProposalSource":
+        """Chunks the operator produced offline: {observation_id: 50x7}."""
         import json as _json
-        import urllib.request
-        req = urllib.request.Request(
-            self.base_url + path, data=_json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return _json.loads(r.read().decode())
+        from pathlib import Path as _P
+        raw = _json.loads(_P(path).read_text())
+        meta = raw.pop("_meta", {}) if isinstance(raw, dict) else {}
+        return cls(chunks={k: v for k, v in raw.items() if not k.startswith("_")},
+                   meta=meta, **kw)
 
-    def health(self) -> dict[str, Any]:
-        import json as _json
-        import urllib.request
-        with urllib.request.urlopen(self.base_url + "/health", timeout=15) as r:
-            return _json.loads(r.read().decode())
+    def _check_contract(self) -> str | None:
+        if self.meta and self.meta.get("use_relative_actions") is not True:
+            return (f"checkpoint reports use_relative_actions="
+                    f"{self.meta.get('use_relative_actions')}; expected True. "
+                    f"This is almost certainly a different training run -- refusing.")
+        return None
 
     def propose(self, observation: dict[str, Any]) -> dict[str, Any]:
+        bad = self._check_contract()
+        if bad:
+            return {"ok": False, "error": bad}
+        oid = observation.get("observation_id")
         try:
-            res = self._post("/infer", {
-                "state": list(observation.get("state") or []),
-                "images": observation.get("images") or {},
-                "task": observation.get("task", "")})
+            rows = (self.chunks.get(oid) if self.infer is None
+                    else self.infer(observation))
         except Exception as exc:                               # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
-        if not res.get("ok"):
-            return {"ok": False, "error": res.get("error", "inference failed")}
-        meta = res.get("meta") or {}
-        # Refuse a checkpoint whose contract does not match what this package
-        # was built against. Silently accepting it is how you get joint targets
-        # in the wrong space.
-        if meta.get("use_relative_actions") is not True:
+        if rows is None:
+            return {"ok": False, "error": f"no proposal for {oid}"}
+        rows = [list(r) for r in rows]
+        if len(rows) != self.expected_steps:
             return {"ok": False,
-                    "error": ("server loaded a checkpoint with "
-                              f"use_relative_actions={meta.get('use_relative_actions')}; "
-                              "expected True. This is almost certainly the wrong "
-                              "checkpoint -- refusing.")}
-        return {"ok": True, "rows": [list(r) for r in res["rows"]],
-                "checkpoint_id": res.get("checkpoint_id") or self.checkpoint_id,
+                    "error": f"expected {self.expected_steps} steps, got {len(rows)}"}
+        if any(len(r) != self.expected_dims for r in rows):
+            return {"ok": False,
+                    "error": f"every row must have {self.expected_dims} values"}
+        return {"ok": True, "rows": rows, "checkpoint_id": self.checkpoint_id,
                 "source": self.name, "is_live": True,
-                "provenance": self.provenance, "server_meta": meta}
+                "provenance": self.provenance, "meta": self.meta}
 
 
 class AstraReviewSource:

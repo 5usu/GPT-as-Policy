@@ -170,28 +170,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     --astra-live is passed. Both are off by default so a first run costs nothing
     and touches nothing.
     """
-    from .transports import AstraReviewSource, Pi05HttpProposalSource
+    from .transports import AstraReviewSource, LocalPi05ProposalSource
     cfg = load_config(args.experiment)
     flat = flatten_config(cfg)
     miss = missing_config(flat, Mode.REVIEWED_EXECUTION)
     _banner("LIVE LOOP: pi0.5 + Astra", Mode.LIVE_SHADOW, miss)
 
-    src = Pi05HttpProposalSource(args.pi05_url,
-                                 checkpoint_id=cfg["checkpoint"]["id"],
-                                 expected_sha256=cfg["checkpoint"].get("sha256"))
-    try:
-        h = src.health()
-        m = h.get("meta") or {}
-        print(f"  pi0.5 server : {args.pi05_url}  ok={h.get('ok')}")
-        print(f"  checkpoint   : {m.get('checkpoint')}")
-        print(f"  use_rel_act  : {m.get('use_relative_actions')} "
-              f"{'OK' if m.get('use_relative_actions') is True else '<-- WRONG CHECKPOINT'}")
-        print(f"  chunk        : {m.get('chunk_size')}/{m.get('n_action_steps')}")
-    except Exception as exc:
-        print(f"  pi0.5 server UNREACHABLE at {args.pi05_url}: "
-              f"{type(exc).__name__}. Start it on the A800 with "
-              f"`python -m hybrid_rollout.robodojo.kuka.pi05_serve`.", file=sys.stderr)
+    if not args.chunks_file:
+        print("  --chunks-file is required: this build does not serve the model. "
+              "Run pi0.5 locally and write {observation_id: 50x7} to JSON, with "
+              "a _meta object carrying use_relative_actions.", file=sys.stderr)
         return 2
+    try:
+        src = LocalPi05ProposalSource.from_file(
+            args.chunks_file, checkpoint_id=cfg["checkpoint"]["id"])
+    except Exception as exc:
+        print(f"  cannot read {args.chunks_file}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 2
+    rel = src.meta.get("use_relative_actions")
+    print(f"  proposals    : {args.chunks_file}  ({len(src.chunks)} chunk(s))")
+    print(f"  checkpoint   : {src.checkpoint_id}")
+    print(f"  use_rel_act  : {rel} "
+          f"{'OK' if rel is True else '<-- WRONG CHECKPOINT, will refuse'}")
 
     review = AstraReviewSource(
         base_url=args.astra_url, model=args.astra_model,
@@ -280,7 +281,9 @@ def main(argv=None) -> int:
 
     rn = sub.add_parser("run", help="live pi0.5 + Astra loop (shadow commands)")
     common(rn)
-    rn.add_argument("--pi05-url", default="http://127.0.0.1:8710")
+    rn.add_argument("--chunks-file",
+                    help="JSON {observation_id: 50x7} from your local pi0.5 run, "
+                         "plus a _meta object with use_relative_actions")
     rn.add_argument("--astra-url", default="https://api.openai.com/v1/responses")
     rn.add_argument("--astra-model", default="gpt-6-astra")
     rn.add_argument("--astra-key-env", default="OPENAI_API_KEY")

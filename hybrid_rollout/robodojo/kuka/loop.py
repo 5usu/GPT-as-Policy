@@ -31,6 +31,7 @@ from typing import Any, Sequence
 from .contract import (ACTION_DIM, ARM_DIM, CONTROL_HZ, MAX_CORRECTED_STEPS,
                        MAX_CORRECTION_DEG, MAX_GRIPPER_DELTA, MAX_STUDENT_STEPS,
                        ROBOT_MODEL, eef_execution_gate)
+from .eef import CartesianCapability, eef_eligible, validate_target
 from .experiment import CameraAssessment, assess_success, retry_limits, stop_conditions
 from .kinematics import UnavailableFK
 from .safety import (ArmingRefused, CommandLedger, Mode, RobotIdentity, Supervisor,
@@ -182,7 +183,8 @@ class KukaReviewLoop:
                  supervisor: Supervisor | None = None,
                  ledger: CommandLedger | None = None,
                  secret: bytes | None = None,
-                 hz: float = CONTROL_HZ) -> None:
+                 hz: float = CONTROL_HZ,
+                 cartesian: CartesianCapability | None = None) -> None:
         self.mode = mode
         self.config = dict(config)
         self.raw_config = dict(raw_config or {})
@@ -197,6 +199,7 @@ class KukaReviewLoop:
         self.ledger = ledger or CommandLedger()
         self.secret = secret
         self.hz = hz
+        self.cartesian = cartesian or CartesianCapability()
         self.cycle = 0
         self.retries = 0
         self.no_progress = 0
@@ -309,13 +312,33 @@ class KukaReviewLoop:
         outcome = Outcome.STUDENT
 
         if dmode == "eef":
+            # Two independent gates, both fail-closed. The static one asks
+            # whether this build may ever do Cartesian; the capability one asks
+            # whether THIS cell has attested the facts that make it checkable.
             allowed, missing, why = eef_execution_gate()
+            cap_ok, cap_missing = self.cartesian.allowed()
+            viol = []
+            if allowed and cap_ok:
+                viol = validate_target(
+                    decision.get("target") or {},
+                    measured=observation.get("measured_pose") or {},
+                    capability=self.cartesian)
+            v_ok, v_codes = eef_eligible(viol)
             rec.decision = {**decision, "eef_gate": {
-                "accepted_as_upstream_decision": True, "execution_allowed": allowed,
-                "missing_prerequisites": missing, "reason": why}}
-            if not allowed:
-                # Accepted, recorded, refused. Fall back to the unmodified prefix.
-                return self._finish(rec, Stage.DECIDE, Outcome.EEF_REFUSED, why)
+                "accepted_as_upstream_decision": True,
+                "static_gate_allowed": allowed, "missing_prerequisites": missing,
+                "cell_attested": cap_ok, "cell_missing": cap_missing,
+                "target_violations": [x.to_log() for x in viol],
+                "execution_allowed": bool(allowed and cap_ok and v_ok),
+                "reason": why,
+                "resolver_note": ("a Cartesian target is resolved by the "
+                                  "CONTROLLER; joint angles cannot be checked "
+                                  "here before they exist")}}
+            if not (allowed and cap_ok and v_ok):
+                detail = why if not allowed else (
+                    "cell not attested: " + ", ".join(cap_missing) if not cap_ok
+                    else "target rejected: " + ", ".join(v_codes))
+                return self._finish(rec, Stage.DECIDE, Outcome.EEF_REFUSED, detail)
 
         if dmode == "edit":
             edit = decision.get("edit") or {}

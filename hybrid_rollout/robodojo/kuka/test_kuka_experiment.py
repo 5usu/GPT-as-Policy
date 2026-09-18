@@ -212,20 +212,36 @@ class TestLiveSourcesAreOffByDefault:
                            provenance="model_predicted", frames={})
         assert "super-secret-value" not in json.dumps(a.build_body(pkt))
 
-    def test_pi05_source_refuses_a_wrong_checkpoint(self):
+    def test_local_source_refuses_a_wrong_checkpoint(self):
         """use_relative_actions=False means a different training run."""
-        from .transports import Pi05HttpProposalSource
-        src = Pi05HttpProposalSource("http://x", transport=lambda u, p, t: {
-            "ok": True, "rows": [[0.0] * 7],
-            "meta": {"use_relative_actions": False}})
-        r = src.propose({"state": [0.0] * 7})
-        assert r["ok"] is False and "wrong checkpoint" in r["error"]
+        from .transports import LocalPi05ProposalSource
+        src = LocalPi05ProposalSource(chunks={"o": [[0.0] * 7] * 50},
+                                      meta={"use_relative_actions": False})
+        r = src.propose({"observation_id": "o"})
+        assert r["ok"] is False and "different training run" in r["error"]
 
-    def test_pi05_source_accepts_the_right_checkpoint(self):
-        from .transports import Pi05HttpProposalSource
-        src = Pi05HttpProposalSource("http://x", transport=lambda u, p, t: {
-            "ok": True, "rows": [[1.0] * 7], "checkpoint_id": "ck",
-            "meta": {"use_relative_actions": True}})
-        r = src.propose({"state": [0.0] * 7})
+    def test_local_source_accepts_the_right_checkpoint(self):
+        from .transports import LocalPi05ProposalSource
+        src = LocalPi05ProposalSource(chunks={"o": [[1.0] * 7] * 50},
+                                      checkpoint_id="ck",
+                                      meta={"use_relative_actions": True})
+        r = src.propose({"observation_id": "o"})
         assert r["ok"] is True and r["is_live"] is True
         assert r["provenance"] == "model_predicted"
+
+    def test_local_source_refuses_a_malformed_chunk(self):
+        from .transports import LocalPi05ProposalSource
+        src = LocalPi05ProposalSource(chunks={"o": [[0.0] * 7] * 10},
+                                      meta={"use_relative_actions": True})
+        assert "expected 50 steps" in src.propose({"observation_id": "o"})["error"]
+
+    def test_local_source_needs_a_source(self):
+        from .transports import LocalPi05ProposalSource
+        with pytest.raises(ValueError):
+            LocalPi05ProposalSource()
+
+    def test_no_serving_layer_remains(self):
+        """The operator runs the model; this package must not prescribe serving."""
+        import importlib
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("hybrid_rollout.robodojo.kuka.pi05_serve")

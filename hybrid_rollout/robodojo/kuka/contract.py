@@ -91,25 +91,33 @@ MAX_STUDENT_STEPS = 15            # upstream STUDENT_STEPS_MAX
 #
 # All four are required. Each is a distinct missing capability, and any one of
 # them absent makes a Cartesian target unsafe to turn into joint commands:
-TCP_TRANSFORM_VERIFIED = False   # custom $TOOL unknown: flange != tool tip
-IK_IMPLEMENTED = False           # no inverse kinematics for this arm
+# The KUKA controller can resolve Cartesian corrections itself, so OUR having an
+# IK solver is not the requirement -- knowing that the controller will do it, in
+# a Cartesian-capable RSI context, is. The deployed .src and Python in
+# KUKA/teleoperation are JOINT-SPACE ONLY (AIPos in, AK out, no TOOL/RIst/RKorr
+# anywhere), so a Cartesian path is not demonstrated by the existing setup and
+# must be attested by an operator. See eef.CartesianCapability.
+TCP_TRANSFORM_VERIFIED = False   # $TOOL is on the controller; supply and verify it
+RSI_CARTESIAN_CONFIGURED = False # the deployed RSI context is joint-only
 WORKSPACE_CONFIGURED = False     # no verified reachable-volume bounds
 COLLISION_CONFIGURED = False     # no cell/self-collision model
 
 EEF_PREREQUISITES = {
     "tcp_transform_verified": TCP_TRANSFORM_VERIFIED,
-    "ik_implemented": IK_IMPLEMENTED,
+    "rsi_cartesian_configured": RSI_CARTESIAN_CONFIGURED,
     "workspace_configured": WORKSPACE_CONFIGURED,
     "collision_configured": COLLISION_CONFIGURED,
 }
 EEF_EXECUTION_ENABLED = all(EEF_PREREQUISITES.values())
 EEF_WITHHELD_REASON = (
     "eef accepted as an upstream decision but REFUSED at the KUKA execution "
-    "gate. A Cartesian target can neither be checked against joint limits nor "
-    "resolved to joint space here. Requires: a multi-pose RSI capture "
-    "(AIPos + RIst) identifying the $TOOL/TCP transform and verifying wrist "
-    "signs; an IK implementation; configured workspace bounds; and a collision "
-    "model.")
+    "gate. A Cartesian target is resolved by the CONTROLLER, so the resulting "
+    "joint angles cannot be checked here before they exist; the defence is "
+    "bounding the step against the measured RIst pose, which requires the cell "
+    "to be attested. Requires: the $TOOL/TCP transform read off the controller "
+    "and verified against RIst readback; a Cartesian-capable RSI configuration "
+    "(the deployed one is joint-only); configured workspace bounds; and a "
+    "collision model.")
 
 
 def eef_execution_gate() -> tuple[bool, list[str], str]:
