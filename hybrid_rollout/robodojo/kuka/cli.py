@@ -86,6 +86,15 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         print(f"    {m:14s} LOCKED -- {whyl[:80]}")
     print()
 
+    rt = I and __import__("hybrid_rollout.robodojo.kuka.cell", fromlist=["x"]).probe_runtime()
+    print("CELL STATE")
+    print(f"  baseline was taken WITH RSI OFF -- resting state, not an invariant")
+    print(f"  live local probe : udp/{I.RSI_UDP_PORT} "
+          f"{'in use' if rt['jetson_rsi_socket_bound'] else 'free'}")
+    print(f"  trigger/program  : {rt['ext_trigger_open']} / {rt['rsi_program_running']}"
+          f"  (None = not probed; run `gonogo --probe-network` on the Jetson)")
+    print()
+
     print("GATEWAY READINESS (HOLD only; says nothing about motion)")
     r = RSIGateway(host=args.rsi_host, port=I.RSI_UDP_PORT).readiness()
     okh, blockers = r.ready_for_hold()
@@ -200,25 +209,39 @@ def cmd_gonogo(args: argparse.Namespace) -> int:
     p = _P(args.config)
     cfg = dc.load(p) if p.exists() else dc.blank()
 
-    # Gates that are about the CELL rather than measured values.
+    # Gates about the CELL rather than measured values. These use a LIVE probe,
+    # never the recorded baseline: that baseline was taken with RSI deliberately
+    # off, so treating it as current would permanently report "not running" even
+    # after the engineer starts it.
     cart_ok, cart_why = I.cartesian_capability()
+    rt = C.probe_runtime(allow_network=args.probe_network)
+    hold_blockers = []
+    if rt["ext_trigger_open"] is None:
+        hold_blockers.append(
+            f"tcp/{C.PORT_EXT_TRIGGER_TCP} state UNKNOWN -- re-run with "
+            f"--probe-network from the Jetson to observe it")
+    elif not rt["ext_trigger_open"]:
+        hold_blockers.append(
+            f"controller-side trigger tcp/{C.PORT_EXT_TRIGGER_TCP} not reachable; "
+            f"the RSI program is not started")
+    if rt["rsi_program_running"] is not True:
+        hold_blockers.append(
+            "RSI program state is only proven by receiving a Rob frame; run the "
+            "HOLD handshake to establish it")
     extra = {
-        "hold_handshake": (
-            C.RSI_PROGRAM_RUNNING and C.JETSON_RSI_SOCKET_BOUND,
-            [b for b in (
-                None if C.RSI_PROGRAM_RUNNING else
-                f"controller-side RSI program not running (tcp/{C.PORT_EXT_TRIGGER_TCP} closed)",
-                None if C.JETSON_RSI_SOCKET_BOUND else
-                f"Jetson udp/{C.PORT_RSI_UDP} socket unbound") if b]),
+        "hold_handshake": (not hold_blockers, hold_blockers),
         "supervised_student_prefix": (
             False, ["CLI-to-RSI execution requires an operator arming action "
                     "and a live HOLD handshake first"]),
         "astra_direct": (cart_ok, cart_why),
     }
     rep = dc.report(cfg, extra_gates=extra)
-    rep["cell_state"] = {"ext_trigger_open": C.EXT_TRIGGER_OPEN,
-                         "rsi_program_running": C.RSI_PROGRAM_RUNNING,
-                         "rsi_socket_bound": C.JETSON_RSI_SOCKET_BOUND}
+    rep["cell_state_live"] = rt
+    rep["cell_state_baseline"] = {
+        "ext_trigger_open": C.BASELINE_EXT_TRIGGER_OPEN,
+        "rsi_program_running": C.BASELINE_RSI_PROGRAM_RUNNING,
+        "rsi_socket_bound": C.BASELINE_JETSON_RSI_SOCKET_BOUND,
+        "note": C.BASELINE_NOTE}
     rep["locked_modes"] = I.modes_locked()
     if args.json:
         print(_json.dumps(rep, indent=1))
@@ -459,6 +482,9 @@ def main(argv=None) -> int:
     gg = sub.add_parser("gonogo", help="machine-readable GO/NO-GO report")
     gg.add_argument("--config", default="deployment_config.json")
     gg.add_argument("--json", action="store_true")
+    gg.add_argument("--probe-network", action="store_true",
+                    help="observe the controller trigger port (read-only "
+                         "connect; opens nothing). Run this on the Jetson.")
     gg.set_defaults(func=cmd_gonogo)
 
     p3 = sub.add_parser("phase3")

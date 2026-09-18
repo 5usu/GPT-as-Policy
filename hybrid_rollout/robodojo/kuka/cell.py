@@ -94,9 +94,92 @@ PORT_FACTS = {
     PORT_EXT_TRIGGER_TCP: ("tcp", "EthernetKRL iicoServer program trigger (--ext)", False),
     PORT_OPCUA_TCP: ("tcp", "OPC UA supervision ONLY -- never robot control", False),
 }
-EXT_TRIGGER_OPEN = False          # observed closed
-RSI_PROGRAM_RUNNING = False       # implied by the trigger port being closed
-JETSON_RSI_SOCKET_BOUND = False   # observed unbound
+# ---------------------------------------------------------------------------
+# TWO CLASSES OF FACT, AND THEY MUST NOT BE CONFUSED
+#
+#   STATIC CONFIG FACTS   read from the controller/.src configuration. True
+#                         whether or not RSI is running. Example: the receive
+#                         configuration accepts AK.A1..A6 + STOPFLAG and has no
+#                         RKorr -- that is what the config SAYS, and starting RSI
+#                         does not change it.
+#
+#   RUNTIME OBSERVATIONS  what was true at one moment. Ports open, sockets bound,
+#                         programs running. THESE EXPIRE.
+#
+# The baseline below was taken WITH RSI DELIBERATELY OFF. It is the resting
+# state, not an invariant, and it must never be used as a gate: after the
+# engineer starts the RSI program these values are stale and would wrongly
+# report "not running". Gates call `probe_runtime()` instead.
+# ---------------------------------------------------------------------------
+BASELINE_TAKEN_WITH_RSI_OFF = True
+BASELINE_NOTE = (
+    "Observed while RSI was intentionally off. Describes the resting state of "
+    "the cell, NOT a permanent property. Re-probe before using as a gate.")
+BASELINE_EXT_TRIGGER_OPEN = False
+BASELINE_RSI_PROGRAM_RUNNING = False
+BASELINE_JETSON_RSI_SOCKET_BOUND = False
+
+# Deprecated aliases kept so nothing silently reads a stale constant: they are
+# the BASELINE, and the names now say so.
+EXT_TRIGGER_OPEN = BASELINE_EXT_TRIGGER_OPEN
+RSI_PROGRAM_RUNNING = BASELINE_RSI_PROGRAM_RUNNING
+JETSON_RSI_SOCKET_BOUND = BASELINE_JETSON_RSI_SOCKET_BOUND
+
+
+def probe_runtime(*, host: str = KUKA_KLI_IP, timeout_s: float = 2.0,
+                  allow_network: bool = False) -> dict:
+    """Observe the CURRENT state. Read-only: connects to nothing unless asked.
+
+    `allow_network=False` (the default) performs only local checks and reports
+    the network-side items as unknown, so importing this module or running a
+    unit test never reaches for the cell. A gate that needs the real state must
+    ask for it explicitly.
+    """
+    import socket as _s
+    out = {"schema": SCHEMA + ".runtime", "probed_at": None,
+           "allow_network": allow_network,
+           "baseline_was_taken_with_rsi_off": BASELINE_TAKEN_WITH_RSI_OFF}
+    import time as _t
+    out["probed_at"] = _t.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    # local: is anything bound on the RSI port here?
+    bound = None
+    try:
+        probe = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+        try:
+            probe.bind(("", PORT_RSI_UDP))
+            bound = False          # we could bind it, so nothing else holds it
+        except OSError:
+            bound = True           # in use: the gateway (or something) holds it
+        finally:
+            probe.close()
+    except Exception:
+        bound = None
+    out["jetson_rsi_socket_bound"] = bound
+
+    if not allow_network:
+        out["ext_trigger_open"] = None
+        out["rsi_program_running"] = None
+        out["note"] = ("network probe not requested; trigger and program state "
+                       "are UNKNOWN rather than assumed from the baseline")
+        return out
+
+    open_ = None
+    try:
+        with _s.create_connection((host, PORT_EXT_TRIGGER_TCP), timeout_s):
+            open_ = True
+    except OSError:
+        open_ = False
+    except Exception:
+        open_ = None
+    out["ext_trigger_open"] = open_
+    # The trigger being open is evidence the iicoServer is listening; it is NOT
+    # proof the RSI program is in its control loop. Only a received Rob frame
+    # proves that, so we report it as unknown rather than inferring.
+    out["rsi_program_running"] = None
+    out["note"] = ("trigger reachability observed; RSI program state is only "
+                   "proven by receiving a Rob frame, so it stays unknown here")
+    return out
 
 # ------------------------------------------------------------------- authority
 AUTHORITY = {
@@ -115,8 +198,8 @@ KNOWN_ABSENT = (
     "frames and writes audit output, and the live camera layer is only the INPUT "
     "side",
     "the 16 measured deployment values are not supplied",
-    "the controller-side RSI program is not running",
-    "the Jetson RSI socket is unbound",
+    "the controller-side RSI program was not running when the baseline was taken",
+    "the Jetson RSI socket was unbound when the baseline was taken",
 )
 
 
@@ -142,16 +225,21 @@ def verify() -> list[CellCheck]:
         f"{RSI_CLIENT} is the UDP client; {RSI_SERVER} answers every {RSI_DT*1000:.0f} ms "
         f"with Type={RSI_REPLY_TYPE} and the identical IPOC"))
     out.append(CellCheck(
-        "ext_trigger_closed", not EXT_TRIGGER_OPEN,
-        f"tcp/{PORT_EXT_TRIGGER_TCP} closed -> the controller-side RSI program is "
-        f"not running"))
+        "baseline_is_not_a_gate", None,
+        f"baseline (trigger open={BASELINE_EXT_TRIGGER_OPEN}, program running="
+        f"{BASELINE_RSI_PROGRAM_RUNNING}, socket bound="
+        f"{BASELINE_JETSON_RSI_SOCKET_BOUND}) was taken WITH RSI OFF. It is the "
+        f"resting state, not an invariant -- gates must call probe_runtime()"))
     out.append(CellCheck(
         "opcua_not_control", True,
         f"tcp/{PORT_OPCUA_TCP} is OPC UA supervision only and must never be "
         f"treated as robot control"))
+    rt = probe_runtime()
     out.append(CellCheck(
-        "rsi_socket_unbound", not JETSON_RSI_SOCKET_BOUND,
-        "the Jetson RSI socket is unbound, so no process can command the arm now"))
+        "rsi_socket_bound_now", rt["jetson_rsi_socket_bound"] is False,
+        f"live local probe: udp/{PORT_RSI_UDP} "
+        f"{'in use' if rt['jetson_rsi_socket_bound'] else 'free'} "
+        f"(probed {rt['probed_at']})"))
     out.append(CellCheck(
         "gripper_is_separate_actuator", not GRIPPER_VIA_CONTROLLER,
         GRIPPER_NOTE.split(". ")[0]))
