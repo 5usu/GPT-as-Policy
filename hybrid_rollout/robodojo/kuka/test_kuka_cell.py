@@ -199,7 +199,7 @@ class TestBaselineIsNotAGate:
 
     def test_baseline_is_labelled_as_taken_with_rsi_off(self):
         assert cell.BASELINE_TAKEN_WITH_RSI_OFF is True
-        assert "not a permanent property" in cell.BASELINE_NOTE
+        assert "NOT a permanent property" in cell.BASELINE_NOTE
 
     def test_runtime_probe_is_separate_from_baseline(self):
         rt = cell.probe_runtime()
