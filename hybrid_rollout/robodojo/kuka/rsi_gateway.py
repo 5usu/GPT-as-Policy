@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 from .contract import ARM_DIM, CONTROL_HZ, GRIPPER_SCALE, POSITION_LIMIT_DEG
+from .interfaces import (EXT_TRIGGER_PORT, RSI_ACCEPTED_ELEMENTS,
+                         RSI_HAS_RKORR, RSI_UDP_PORT)
 from .safety import ArmingRefused, CommandEnvelope
 from .transports import (RSI_CYCLE_TIME, RSI_DEFAULT_PORT, RSI_IPOC_FIELD,
                          RSI_JOINT_PRECISION, RSI_LOCAL_IP_DEFAULT,
@@ -69,6 +71,15 @@ def parse_frame(xml: str) -> tuple[int | None, list[float] | None]:
 
 def build_frame(ipoc: int, joints_deg: Sequence[float], *, gripper_pos: int = 0,
                 stop_flag: int = 0) -> str:
+    """The <Sen Type="ImFree"> reply. IPOC is echoed, never regenerated.
+
+    NOTE ON GRIPPER_POS: this cell drives the gripper directly over Modbus RTU
+    on /dev/ttyUSB0, NOT through the KUKA controller, so this element is INERT
+    here. It is kept because the deployed frame builder emits it and the format
+    must match byte for byte -- but a gripper command does not travel this way,
+    and is gated and audited separately. See gripper.py.
+    """
+
     nl = "\r\n"
     ak = " ".join(f'A{i + 1}="{v:.{RSI_JOINT_PRECISION}f}"'
                   for i, v in enumerate(list(joints_deg)[:ARM_DIM]))
@@ -80,14 +91,162 @@ def build_frame(ipoc: int, joints_deg: Sequence[float], *, gripper_pos: int = 0,
             f'</{RSI_RESPONSE_ROOT}>')
 
 
+#: VERIFIED CELL FACT: the deployed Jetson fills the 250 Hz loop with
+#: Ruckig(NUM_JOINTS, 0.004) -- jerk-limited online trajectory generation. The
+#: linear bridge below is NOT that. Linear interpolation is position-continuous
+#: but velocity-DISCONTINUOUS at every segment boundary: the arm is asked to
+#: change speed instantaneously each time a new chunk arrives. Over an 8-cycle
+#: bridge at low speed that may be tolerable; it is not what the cell runs and it
+#: must not be presented as equivalent.
+#:
+#: This build therefore REFUSES to use linear interpolation for real motion.
+#: `RSIGateway` requires an explicit interpolator, and the linear one is marked
+#: not-deployable so it can be used in tests and shadow runs without ever being
+#: mistaken for the real thing.
+INTERPOLATOR_DEPLOYED = "Ruckig"
+INTERPOLATOR_DEPLOYED_ARGS = ("NUM_JOINTS", 0.004)
+
+
+class LinearInterpolator:
+    """Test/shadow only. Velocity-discontinuous; not the deployed method."""
+
+    name = "linear"
+    deployable = False
+    reason_not_deployable = (
+        "velocity-discontinuous at segment boundaries; the cell runs "
+        "Ruckig(NUM_JOINTS, 0.004) and this is not equivalent")
+
+    def __call__(self, start, target, cycles):
+        return interpolate(start, target, cycles)
+
+
+class RuckigInterpolator:
+    """Adapter for the deployed jerk-limited generator.
+
+    Not implemented here: Ruckig is the deployment engineer's component and
+    lives on the Jetson. This adapter exists so the gateway can REQUIRE it by
+    name rather than silently substituting something else.
+    """
+
+    name = "ruckig"
+    deployable = True
+
+    def __init__(self, generator=None) -> None:
+        self.generator = generator
+
+    def __call__(self, start, target, cycles):
+        if self.generator is None:
+            raise RuntimeError(
+                "RuckigInterpolator has no generator. Supply the Jetson's "
+                "Ruckig(NUM_JOINTS, 0.004) instance; this package does not "
+                "reimplement it and will not substitute linear interpolation "
+                "for real motion.")
+        return self.generator(start, target, cycles)
+
+
 def interpolate(start: Sequence[float], target: Sequence[float],
                 cycles: int) -> list[list[float]]:
-    """Linear bridge from the measured pose to one commanded step."""
+    """Linear bridge. NOT the deployed method -- see LinearInterpolator."""
     if cycles < 1:
         raise ValueError("cycles must be >= 1")
     s, t = list(start)[:ARM_DIM], list(target)[:ARM_DIM]
     return [[s[j] + (t[j] - s[j]) * (k + 1) / cycles for j in range(ARM_DIM)]
             for k in range(cycles)]
+
+
+def validate_cycles(start: Sequence[float], cycles: Sequence[Sequence[float]], *,
+                    hz: float) -> list[str]:
+    """Per-cycle position and velocity check over an interpolated trajectory."""
+    from .contract import max_step_deg
+    caps = max_step_deg(hz)
+    problems: list[str] = []
+    prev = list(start)[:ARM_DIM]
+    for i, row in enumerate(cycles):
+        for j in range(ARM_DIM):
+            lo, hi = POSITION_LIMIT_DEG[j]
+            v = float(row[j])
+            if not lo <= v <= hi:
+                problems.append(f"cycle {i} joint {j+1}: {v:.3f} outside [{lo}, {hi}]")
+            d = abs(v - prev[j])
+            if d > caps[j]:
+                problems.append(f"cycle {i} joint {j+1}: step {d:.4f} deg > cap "
+                                f"{caps[j]:.4f} at {hz:.0f} Hz")
+        prev = [float(x) for x in row[:ARM_DIM]]
+    return problems
+
+
+@dataclass
+class Readiness:
+    """HOLD-only readiness. FAIL-CLOSED: every unknown is a blocker.
+
+    This answers one question -- may we open a socket and start answering the
+    controller, commanding nothing? It deliberately does NOT answer whether
+    anything may move; that is `safety.authorise`.
+    """
+    socket_open: bool = False
+    listener_bound: bool = False
+    frames_seen: int = 0
+    last_frame_age_s: float | None = None
+    ipoc_monotonic: bool = True
+    measured_pose_known: bool = False
+    config_matches: bool = False
+    config_problems: list[str] = field(default_factory=list)
+    motion_enabled: bool = False
+    stopped: str | None = None
+
+    def ready_for_hold(self) -> tuple[bool, list[str]]:
+        blockers: list[str] = []
+        if not self.socket_open:
+            blockers.append("no socket open")
+        if not self.listener_bound:
+            blockers.append(f"not bound on udp/{RSI_UDP_PORT}")
+        if self.frames_seen == 0:
+            blockers.append("no RSI frame received yet -- the controller has not "
+                            "connected, or the RSI program is not running")
+        if self.last_frame_age_s is not None and self.last_frame_age_s > 0.05:
+            blockers.append(f"last frame {self.last_frame_age_s:.3f}s old (stale)")
+        if not self.ipoc_monotonic:
+            blockers.append("IPOC went backwards -- session is not coherent")
+        if not self.measured_pose_known:
+            blockers.append("no measured joint pose parsed yet")
+        if not self.config_matches:
+            blockers.append("RSI element mismatch: " + "; ".join(self.config_problems))
+        if self.stopped:
+            blockers.append(f"gateway latched stopped: {self.stopped}")
+        return (not blockers), blockers
+
+    def to_log(self) -> dict[str, Any]:
+        ok, blockers = self.ready_for_hold()
+        return {"ready_for_hold": ok, "blockers": blockers,
+                "socket_open": self.socket_open,
+                "listener_bound": self.listener_bound,
+                "frames_seen": self.frames_seen,
+                "last_frame_age_s": self.last_frame_age_s,
+                "ipoc_monotonic": self.ipoc_monotonic,
+                "measured_pose_known": self.measured_pose_known,
+                "config_matches": self.config_matches,
+                "config_problems": self.config_problems,
+                "motion_enabled": self.motion_enabled,
+                "note": ("readiness for HOLD only. It says nothing about whether "
+                         "anything may move -- see safety.authorise.")}
+
+
+def check_rsi_elements(declared: Sequence[str] | None = None) -> tuple[bool, list[str]]:
+    """Does the cell's RSI receive configuration match what this build assumes?
+
+    The deployed configuration accepts AK.A1..A6 plus STOPFLAG and has no RKorr.
+    A mismatch is a refusal rather than an adaptation: sending elements the
+    controller does not accept is not a degraded mode, it is an error.
+    """
+    have = tuple(declared) if declared is not None else RSI_ACCEPTED_ELEMENTS
+    problems = []
+    missing = [e for e in RSI_ACCEPTED_ELEMENTS if e not in have]
+    if missing:
+        problems.append(f"missing expected element(s): {', '.join(missing)}")
+    if "RKorr" in have and not RSI_HAS_RKORR:
+        problems.append("RKorr present but this build treats Cartesian as "
+                        "unsupported; re-verify before enabling")
+    return (not problems), problems
 
 
 @dataclass
@@ -123,6 +282,7 @@ class RSIGateway:
                  control_hz: float = CONTROL_HZ,
                  cycle_time: float = RSI_CYCLE_TIME,
                  max_frame_gap_s: float = 0.050,
+                 interpolator: Any = None,
                  sock: Any = None) -> None:
         self.host, self.port = host, port
         self.enable_motion = bool(enable_motion)
@@ -131,6 +291,13 @@ class RSIGateway:
         self.cycle_time = cycle_time
         self.max_frame_gap_s = max_frame_gap_s
         self.cycles_per_step = max(1, round((1.0 / control_hz) / cycle_time))
+        self.interpolator = interpolator or LinearInterpolator()
+        if self.enable_motion and not getattr(self.interpolator, "deployable", False):
+            raise ArmingRefused(
+                "interpolator_not_deployable",
+                f"enable_motion=True with the {self.interpolator.name!r} "
+                f"interpolator: {getattr(self.interpolator, 'reason_not_deployable', '')}. "
+                f"Supply {INTERPOLATOR_DEPLOYED}{INTERPOLATOR_DEPLOYED_ARGS}.")
         self.stats = GatewayStats()
         self._sock = sock
         self._peer: tuple[str, int] | None = None
@@ -139,6 +306,10 @@ class RSIGateway:
         self._delivered: list[dict[str, Any]] = []
         self._stop = False
         self._last_measured: list[float] | None = None
+        self._last_frame_at: float | None = None
+
+    def _interp(self, start, target, cycles):
+        return self.interpolator(start, target, cycles)
 
     # --------------------------------------------------------------- policy
     @property
@@ -195,7 +366,16 @@ class RSIGateway:
                 raise ArmingRefused("position_limit",
                                     f"joint {j + 1} target {row[j]} outside "
                                     f"[{lo}, {hi}]")
-        self._pending = interpolate(self._last_measured, row, self.cycles_per_step)
+        cycles = self._interp(self._last_measured, row, self.cycles_per_step)
+        # VERIFIED CELL FACT: the interpolated trajectory must be validated at
+        # EVERY cycle. A chunk that is feasible on average can still contain a
+        # single infeasible 4 ms step, and that step is what the controller sees.
+        bad = validate_cycles(self._last_measured, cycles, hz=1.0 / self.cycle_time)
+        if bad:
+            raise ArmingRefused(
+                "interpolated_cycle_infeasible",
+                f"{len(bad)} interpolated cycle(s) breach limits: {bad[0]}")
+        self._pending = cycles
         self._pending_grip = gripper_to_raw(row[ARM_DIM]) if len(row) > ARM_DIM else 0
         rec = {"command_id": envelope.command_id,
                "envelope_sha256": envelope.digest(),
@@ -224,6 +404,7 @@ class RSIGateway:
             self.stats.ipoc_regressions += 1
         self.stats.last_ipoc = ipoc
         self._last_measured = measured
+        self._last_frame_at = t0
 
         if self._pending and self.can_move_robot:
             target = self._pending.pop(0)
@@ -255,9 +436,33 @@ class RSIGateway:
             n += 1
         return self.stats
 
+    def readiness(self, *, declared_elements: Sequence[str] | None = None,
+                  now: float | None = None) -> Readiness:
+        """Snapshot of whether HOLD may begin. Never opens anything."""
+        import time as _t
+        cfg_ok, cfg_problems = check_rsi_elements(declared_elements)
+        age = None
+        if self.stats.frames_in and self._last_frame_at is not None:
+            age = (_t.monotonic() if now is None else now) - self._last_frame_at
+        return Readiness(
+            socket_open=self._sock is not None,
+            listener_bound=self._sock is not None,
+            frames_seen=self.stats.frames_in,
+            last_frame_age_s=age,
+            ipoc_monotonic=self.stats.ipoc_regressions == 0,
+            measured_pose_known=self._last_measured is not None,
+            config_matches=cfg_ok, config_problems=cfg_problems,
+            motion_enabled=self.enable_motion,
+            stopped=self.stats.stopped_reason)
+
     def to_log(self) -> dict[str, Any]:
         return {"schema": SCHEMA, "name": self.name,
                 "bind": f"{self.host}:{self.port}",
+                "control_stream": f"udp/{RSI_UDP_PORT} (this)",
+                "ext_trigger_channel": (f"tcp/{EXT_TRIGGER_PORT} -- start/stop "
+                                        f"only, NOT used by this package"),
+                "accepted_elements": list(RSI_ACCEPTED_ELEMENTS),
+                "cartesian_supported": RSI_HAS_RKORR,
                 "can_move_robot": self.can_move_robot,
                 "enable_motion": self.enable_motion,
                 "cycles_per_step": self.cycles_per_step,

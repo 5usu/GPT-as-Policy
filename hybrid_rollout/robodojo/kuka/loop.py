@@ -32,6 +32,7 @@ from .contract import (ACTION_DIM, ARM_DIM, CONTROL_HZ, MAX_CORRECTED_STEPS,
                        MAX_CORRECTION_DEG, MAX_GRIPPER_DELTA, MAX_STUDENT_STEPS,
                        ROBOT_MODEL, eef_execution_gate)
 from .eef import CartesianCapability, eef_eligible, validate_target
+from .interfaces import cartesian_capability, modes_locked
 from .experiment import CameraAssessment, assess_success, retry_limits, stop_conditions
 from .kinematics import UnavailableFK
 from .safety import (ArmingRefused, CommandLedger, Mode, RobotIdentity, Supervisor,
@@ -57,12 +58,27 @@ class Stage(str, Enum):
     REPLAN = "replan"
 
 
+#: VERIFIED DEPLOYMENT FACT. The deployed RSI receive configuration accepts
+#: AK.A1..A6 plus STOPFLAG only. Joint corrections ARE deliverable over that, so
+#: `edit` is not blocked by the interface -- but it stays off until a supervised
+#: campaign has validated it. Only a bounded STUDENT PREFIX of pi0.5 joint
+#: actions may execute for now. `eef` and Astra-direct are blocked by the
+#: interface itself and cannot be enabled by configuration here.
+EXECUTABLE_DECISION_MODES = frozenset({"student"})
+EDIT_EXECUTION_ENABLED = False
+EDIT_LOCK_REASON = (
+    "joint edits are deliverable over AK.A1-A6, but execution of a reviewer "
+    "correction stays disabled until a supervised campaign validates it. The "
+    "edit is still computed, validated and recorded; it is simply not emitted.")
+
+
 class Outcome(str, Enum):
     OBSERVED_ONLY = "observed_only"          # replay / shadow completed a review
     STUDENT = "student"
     APPLIED_EDIT = "applied_edit"
     REJECTED_EDIT = "rejected_edit"
     EEF_REFUSED = "eef_refused"
+    EDIT_LOCKED = "edit_locked"
     GATE_BLOCKED = "gate_blocked"
     ARMING_REFUSED = "arming_refused"
     COMMAND_SENT = "command_sent"
@@ -108,6 +124,7 @@ class CycleRecord:
     success: dict[str, Any] | None = None
     stop_signals: list[str] = field(default_factory=list)
     replan: dict[str, Any] = field(default_factory=dict)
+    emitted_mode: str | None = None      # what actually leaves, not what was asked
     commands_possible_in_mode: bool = False
     approved_for_execution: bool = False
     written_at: str = ""
@@ -371,6 +388,17 @@ class KukaReviewLoop:
                     rec.improvement_valid = False
                     candidate, outcome = [list(r) for r in rows[:n_student]], Outcome.REJECTED_EDIT
                     rec.reason = why
+                elif not EDIT_EXECUTION_ENABLED:
+                    # The edit was sound. It is still not emitted: only a
+                    # student prefix may execute in this build. Recorded in
+                    # full so the campaign that unlocks it has evidence.
+                    rec.improvement_valid = True
+                    rec.decision = {**decision, "edit_computed": {
+                        "accepted": True, "n_steps": n_edit,
+                        "delta_joint_deg": list(deltas),
+                        "emitted": False, "lock_reason": EDIT_LOCK_REASON}}
+                    candidate = [list(r) for r in rows[:n_student]]
+                    outcome = Outcome.EDIT_LOCKED
                 else:
                     rec.improvement_valid = True
                     candidate, outcome = edited, Outcome.APPLIED_EDIT
@@ -400,6 +428,19 @@ class KukaReviewLoop:
                 rec, Stage.VALIDATE, Outcome.OBSERVED_ONLY,
                 f"{self.mode.value}: review complete; command construction is not "
                 f"reachable in this mode ({outcome.value}, execution_safe={safe})")
+
+        # --- MODE LOCK: gate on what is EMITTED, not what was requested ------
+        # A rejected or locked edit falls back to the unmodified student prefix,
+        # and that prefix is exactly what this build permits. Gating on the
+        # reviewer's requested mode would block a fallback that is already the
+        # permitted thing -- the question is what leaves this function.
+        emit_mode = "edit" if outcome is Outcome.APPLIED_EDIT else "student"
+        rec.emitted_mode = emit_mode
+        if emit_mode not in EXECUTABLE_DECISION_MODES:
+            locked = modes_locked().get(emit_mode, "not executable in this build")
+            return self._finish(
+                rec, Stage.VALIDATE, Outcome.GATE_BLOCKED,
+                f"emitting {emit_mode!r} is not permitted here: {locked}")
 
         # --- ENVELOPE ---------------------------------------------------------
         one_step = [list(final[0])] if final else []

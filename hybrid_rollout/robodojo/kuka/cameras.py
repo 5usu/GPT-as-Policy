@@ -34,6 +34,14 @@ from typing import Any, Protocol, Sequence
 SCHEMA = "hybrid_rollout.robodojo.kuka.cameras.v1"
 
 CAMERA_NAMES = ("base", "wrist")
+
+#: VERIFIED CELL FACT: two physical Tera USB cameras expose FOUR video nodes --
+#: 0/1 and 2/3. Only the first of each pair captures; the second is a metadata
+#: node. Which physical camera is `base` and which is `wrist` is not derivable
+#: from the node number, so the mapping must be given.
+CAPTURE_NODES = (0, 2)
+METADATA_NODES = (1, 3)
+NODE_PAIRS = {0: 1, 2: 3}
 WIDTH, HEIGHT, FPS = 640, 480, 30
 DEFAULT_MAX_AGE_S = 0.25          # ~7 frames at 30 fps
 
@@ -144,6 +152,14 @@ class LiveCameras:
         self._grabbers: dict[str, _Grabber] = {}
 
     def start(self) -> "LiveCameras":
+        bad = {n: i for n, i in self.mapping.items() if i in METADATA_NODES}
+        if bad:
+            raise CameraError(
+                f"{bad} point at metadata nodes. On this cell each Tera camera "
+                f"exposes two nodes ({NODE_PAIRS}); only {CAPTURE_NODES} "
+                f"capture. A metadata node opens without error and yields no "
+                f"frames, which looks like a dead camera rather than a "
+                f"misconfiguration.")
         missing = [n for n in self.names if n not in self.mapping]
         if missing:
             raise CameraError(

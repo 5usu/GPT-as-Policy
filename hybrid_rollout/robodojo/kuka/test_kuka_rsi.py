@@ -10,8 +10,8 @@ import time
 import pytest
 
 from .contract import ARM_DIM, POSITION_LIMIT_DEG
-from .rsi_gateway import (FakeController, RSIGateway, build_frame, interpolate,
-                          parse_frame)
+from .rsi_gateway import (FakeController, RSIGateway, RuckigInterpolator,
+                          build_frame, interpolate, parse_frame)
 from .safety import ArmingRefused, CommandEnvelope
 
 SECRET = b"test-only"
@@ -27,10 +27,19 @@ def envelope(row, secret=SECRET, approved=True):
     return e
 
 
+#: A deployable-shaped interpolator for tests. The real cell uses
+#: Ruckig(NUM_JOINTS, 0.004); here the generator is the linear bridge, which is
+#: adequate for exercising the gateway's framing and gating but is NOT the
+#: deployed motion profile. Declared through RuckigInterpolator so the gateway's
+#: deployability check is satisfied explicitly rather than bypassed.
+def make_interpolator():
+    return RuckigInterpolator(generator=interpolate)
+
+
 def pair(enable_motion=False):
     """A gateway bound on loopback plus a controller pointed at it."""
     g = RSIGateway(host="127.0.0.1", port=0, enable_motion=enable_motion,
-                   secret=SECRET)
+                   secret=SECRET, interpolator=make_interpolator())
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("127.0.0.1", 0))
     s.settimeout(0.5)

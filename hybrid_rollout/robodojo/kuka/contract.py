@@ -97,8 +97,13 @@ MAX_STUDENT_STEPS = 15            # upstream STUDENT_STEPS_MAX
 # KUKA/teleoperation are JOINT-SPACE ONLY (AIPos in, AK out, no TOOL/RIst/RKorr
 # anywhere), so a Cartesian path is not demonstrated by the existing setup and
 # must be attested by an operator. See eef.CartesianCapability.
-TCP_TRANSFORM_VERIFIED = False   # $TOOL is on the controller; supply and verify it
-RSI_CARTESIAN_CONFIGURED = False # the deployed RSI context is joint-only
+# VERIFIED DEPLOYMENT FACT: the deployed RSI receive configuration accepts
+# AK.A1..A6 plus STOPFLAG and has NO RKorr element. Cartesian corrections and
+# end-effector targets therefore cannot be delivered to this controller at all.
+# This is an INTERFACE limit, not a calibration gap -- supplying the $TOOL
+# transform would not enable it. See interfaces.py.
+TCP_TRANSFORM_VERIFIED = False   # $TOOL is UNKNOWN; must be supplied and verified
+RSI_CARTESIAN_CONFIGURED = False # no RKorr in the deployed receive config
 WORKSPACE_CONFIGURED = False     # no verified reachable-volume bounds
 COLLISION_CONFIGURED = False     # no cell/self-collision model
 

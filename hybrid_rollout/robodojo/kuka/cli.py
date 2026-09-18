@@ -50,9 +50,51 @@ def _banner(phase: str, mode: Mode, cfg_missing: list[str]) -> None:
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
+    from . import interfaces as I
+    from .loop import EDIT_EXECUTION_ENABLED, EXECUTABLE_DECISION_MODES
+    from .rsi_gateway import RSIGateway, check_rsi_elements
     cfg = load_config(args.experiment)
     flat = flatten_config(cfg)
     print(f"PREFLIGHT -- experiment {args.experiment!r}\n")
+
+    print('THE THREE THINGS CALLED "TCP" HERE -- do not conflate them')
+    for f in I.describe():
+        where = (f"{f['protocol']}/{f['port']}" if f["port"] else "geometry, no port")
+        print(f"  {f['meaning']:32s} {where:12s} "
+              f"carries motion: {f['carries_motion_commands']}")
+        print(f"      {f['description'].splitlines()[0][:96]}")
+    print()
+
+    print("RSI RECEIVE CONFIGURATION (verified deployment fact)")
+    print(f"  accepts          : {', '.join(I.RSI_ACCEPTED_ELEMENTS)}")
+    print(f"  RKorr present    : {I.RSI_HAS_RKORR}")
+    print(f"  cartesian usable : {I.cartesian_capability()[0]}")
+    ok, why = check_rsi_elements()
+    print(f"  element check    : {'match' if ok else '; '.join(why)}")
+    print()
+
+    print("TOOL CENTER POINT (geometry, unrelated to any port)")
+    print(f"  $TOOL known      : {I.TOOL_TRANSFORM_KNOWN}")
+    print(f"  FK frame         : {I.FK_FRAME}  (tool tip: {I.FK_IS_TOOL_TIP})")
+    print(f"  {I.TOOL_NOTE[:96]}")
+    print()
+
+    print("EXECUTION LOCKS")
+    print(f"  emittable modes  : {sorted(EXECUTABLE_DECISION_MODES)}")
+    print(f"  edit execution   : {EDIT_EXECUTION_ENABLED}")
+    for m, whyl in I.modes_locked().items():
+        print(f"    {m:14s} LOCKED -- {whyl[:80]}")
+    print()
+
+    print("GATEWAY READINESS (HOLD only; says nothing about motion)")
+    r = RSIGateway(host=args.rsi_host, port=I.RSI_UDP_PORT).readiness()
+    okh, blockers = r.ready_for_hold()
+    print(f"  ready for HOLD   : {okh}")
+    for b in blockers:
+        print(f"    - {b}")
+    print(f"  {I.SILENCE_IS_UNSAFE[:96]}")
+    print(f"  {I.ESTOP_AUTHORITATIVE[:96]}")
+    print()
     for mode in (Mode.REVIEWED_EXECUTION, Mode.ASTRA_DIRECT):
         miss = missing_config(flat, mode)
         print(f"{mode.value}: {len(miss)} missing")
@@ -264,8 +306,9 @@ def main(argv=None) -> int:
         sp.add_argument("--chunk-steps", type=int, default=50)
         sp.add_argument("--limit", type=int)
 
-    pf = sub.add_parser("preflight"); pf.add_argument("--experiment",
-                                                      default="dishwasher_door_open")
+    pf = sub.add_parser("preflight")
+    pf.add_argument("--experiment", default="dishwasher_door_open")
+    pf.add_argument("--rsi-host", default="172.17.255.2")
     pf.set_defaults(func=cmd_preflight)
 
     p1 = sub.add_parser("phase1"); common(p1)
