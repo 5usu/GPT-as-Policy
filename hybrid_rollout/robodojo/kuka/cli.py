@@ -124,6 +124,116 @@ def _episode(args) -> RecordedEpisode:
                                 state_rows=state, traj_rows=traj)
 
 
+
+def cmd_measure(args: argparse.Namespace) -> int:
+    """Guided collection of operator-measured cell values.
+
+    COLLECTS AND VALIDATES. NEVER INFERS. Every prompt is a question for a human
+    who has measured the thing; there is no path that fills one in from a similar
+    cell, a previous run, or a plausible range. Blank input leaves the value null
+    and the corresponding gate stays NO-GO.
+    """
+    import json as _json
+    from pathlib import Path as _P
+    from . import deployment_config as dc
+
+    out = _P(args.out)
+    cfg = dc.load(out) if out.exists() and not args.fresh else dc.blank()
+    if args.checklist:
+        print(dc.checklist(cfg))
+        return 0
+
+    print("GUIDED MEASUREMENT -- values you have MEASURED on the real cell.")
+    print("Blank leaves a value unset. Nothing here is inferred or defaulted.")
+    print(f"Writing to {out}\n")
+    cfg.setdefault("cell", args.cell)
+    cfg["measured_by"] = args.operator or cfg.get("measured_by")
+    cfg["measured_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    only = set(args.only.split(",")) if args.only else None
+    section = None
+    for key, (sec, what, why) in dc.FIELDS.items():
+        if only and sec not in only and key not in only:
+            continue
+        if sec != section:
+            section = sec
+            print(f"\n[{sec.upper()}]")
+        cur = (cfg["values"] or {}).get(key)
+        shown = "unset" if cur in (None, "", [], {}) else _json.dumps(cur)[:60]
+        print(f"\n  {key}")
+        print(f"    measure: {what}")
+        print(f"    why    : {why}")
+        print(f"    current: {shown}")
+        if args.non_interactive:
+            continue
+        try:
+            raw = input("    value (JSON, blank to skip): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  interrupted; keeping what was already set")
+            break
+        if not raw:
+            continue
+        try:
+            cfg["values"][key] = _json.loads(raw)
+        except Exception:
+            cfg["values"][key] = raw       # a plain string is a legitimate answer
+        print(f"    recorded: {_json.dumps(cfg['values'][key])[:70]}")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(_json.dumps(cfg, indent=1) + "\n")
+    rep = dc.report(cfg)
+    print(f"\nwrote {out}")
+    print(f"overall: {rep['overall']}")
+    for g, d in rep["gates"].items():
+        print(f"  {g:28s} {d['decision']:6s} ({d['n_missing_values']} missing)")
+    return 0
+
+
+def cmd_gonogo(args: argparse.Namespace) -> int:
+    """Machine-readable GO/NO-GO naming every failed gate."""
+    import json as _json
+    from pathlib import Path as _P
+    from . import cell as C
+    from . import deployment_config as dc
+    from . import interfaces as I
+
+    p = _P(args.config)
+    cfg = dc.load(p) if p.exists() else dc.blank()
+
+    # Gates that are about the CELL rather than measured values.
+    cart_ok, cart_why = I.cartesian_capability()
+    extra = {
+        "hold_handshake": (
+            C.RSI_PROGRAM_RUNNING and C.JETSON_RSI_SOCKET_BOUND,
+            [b for b in (
+                None if C.RSI_PROGRAM_RUNNING else
+                f"controller-side RSI program not running (tcp/{C.PORT_EXT_TRIGGER_TCP} closed)",
+                None if C.JETSON_RSI_SOCKET_BOUND else
+                f"Jetson udp/{C.PORT_RSI_UDP} socket unbound") if b]),
+        "supervised_student_prefix": (
+            False, ["CLI-to-RSI execution requires an operator arming action "
+                    "and a live HOLD handshake first"]),
+        "astra_direct": (cart_ok, cart_why),
+    }
+    rep = dc.report(cfg, extra_gates=extra)
+    rep["cell_state"] = {"ext_trigger_open": C.EXT_TRIGGER_OPEN,
+                         "rsi_program_running": C.RSI_PROGRAM_RUNNING,
+                         "rsi_socket_bound": C.JETSON_RSI_SOCKET_BOUND}
+    rep["locked_modes"] = I.modes_locked()
+    if args.json:
+        print(_json.dumps(rep, indent=1))
+        return 0
+    print(f"GO / NO-GO   config={p if p.exists() else '(none: all values null)'}")
+    print(f"overall: {rep['overall']}\n")
+    for g, d in rep["gates"].items():
+        print(f"  {g:28s} {d['decision']}")
+        for b in d["blockers"][:6]:
+            print(f"      - {b}")
+        if len(d["blockers"]) > 6:
+            print(f"      ... and {len(d['blockers']) - 6} more")
+    return 0
+
+
 def cmd_phase1(args: argparse.Namespace) -> int:
     """Show Astra a recorded trajectory + the matching observation frames."""
     cfg = load_config(args.experiment)
@@ -335,6 +445,21 @@ def main(argv=None) -> int:
                     help="MAKE PAID API CALLS. Off by default.")
     rn.add_argument("--audit"); rn.add_argument("--serial")
     rn.set_defaults(func=cmd_run)
+
+    mz = sub.add_parser("measure", help="guided collection of measured cell values")
+    mz.add_argument("--out", default="deployment_config.json")
+    mz.add_argument("--cell", default="dishwasher_table")
+    mz.add_argument("--operator")
+    mz.add_argument("--only", help="comma-separated sections or field names")
+    mz.add_argument("--checklist", action="store_true", help="print and exit")
+    mz.add_argument("--fresh", action="store_true", help="start from a blank config")
+    mz.add_argument("--non-interactive", action="store_true")
+    mz.set_defaults(func=cmd_measure)
+
+    gg = sub.add_parser("gonogo", help="machine-readable GO/NO-GO report")
+    gg.add_argument("--config", default="deployment_config.json")
+    gg.add_argument("--json", action="store_true")
+    gg.set_defaults(func=cmd_gonogo)
 
     p3 = sub.add_parser("phase3")
     p3.add_argument("--experiment", default="dishwasher_door_open")

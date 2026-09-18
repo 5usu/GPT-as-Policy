@@ -9,7 +9,8 @@ import pytest
 
 from . import cell
 from .cameras import CAPTURE_NODES, METADATA_NODES, NODE_PAIRS, CameraError, LiveCameras
-from .gripper import GripperCapability, plan, stop_semantics
+from .gripper import (GripperCapability, GripperController, SafeAction,
+                      stop_semantics)
 from .rsi_gateway import (INTERPOLATOR_DEPLOYED, LinearInterpolator, RSIGateway,
                           RuckigInterpolator, validate_cycles)
 from .safety import ArmingRefused
@@ -126,8 +127,8 @@ class TestGripperIsSeparate:
 
     def test_rsi_stop_does_not_stop_the_gripper(self):
         s = stop_semantics()
-        assert s["rsi_stop_affects_arm"] is True
-        assert s["rsi_stop_affects_gripper"] is False
+        assert s["rsi_stopflag_affects_arm"] is True
+        assert s["rsi_stopflag_affects_gripper"] is False
         assert "stays closed" in s["consequence"]
 
     def test_polarity_is_required_and_unknown(self):
@@ -136,15 +137,32 @@ class TestGripperIsSeparate:
         assert any("polarity" in m for m in cap.missing())
 
     def test_command_is_planned_and_audited_but_not_emitted(self):
-        c = plan(1.0, GripperCapability())
+        c = GripperController(GripperCapability()).command(1.0)
         assert c.intent == "close" and c.emitted is False and c.refused_reason
 
-    def test_even_fully_attested_does_not_emit_without_a_transport(self):
-        cap = GripperCapability(polarity={"open": 0, "closed": 12000},
-                                max_force=10, enabled=True)
+    def test_attested_but_no_transport_does_not_emit(self):
+        cap = GripperCapability(device_id="ch340",
+                                polarity={"open": 0, "closed": 12000},
+                                open_close_limits={"open": 0, "closed": 12000},
+                                speed_force_limits={"force": 10},
+                                safe_action=SafeAction.HOLD,
+                                observed_state_ack=True, enabled=True)
         assert cap.allowed()[0] is True
-        c = plan(1.0, cap)
+        c = GripperController(cap).command(1.0)
         assert c.emitted is False and "no gripper transport" in c.refused_reason
+
+    def test_every_capability_field_is_individually_required(self):
+        base = dict(device_id="ch340", polarity={"open": 0, "closed": 1},
+                    open_close_limits={"open": 0, "closed": 1},
+                    speed_force_limits={"force": 10},
+                    safe_action=SafeAction.HOLD, observed_state_ack=True,
+                    enabled=True)
+        assert GripperCapability(**base).allowed()[0] is True
+        for k, off in (("device_id", None), ("polarity", None),
+                       ("open_close_limits", None), ("speed_force_limits", None),
+                       ("safe_action", SafeAction.UNKNOWN),
+                       ("observed_state_ack", False), ("enabled", False)):
+            assert GripperCapability(**{**base, k: off}).allowed()[0] is False, k
 
 
 class TestCameraNodes:

@@ -1,5 +1,13 @@
 # Deployment run sheet — KUKA dishwasher cell
 
+> **SOFTWARE-COMPLETE ≠ REAL-ARM GO.**
+> The code is implemented, gated and tested offline. Real execution is **NO-GO**
+> until the values below are measured and the live handshake passes. Passing
+> tests say the gates work; they say nothing about the cell.
+>
+> **If a gate fails, stop.** Do not fall back to the experimental path — the
+> production `infer_act.py` / kuka-web path is separate and stays separate.
+
 Every value below must be **measured on the real cell** and supplied by the
 deployment engineer. They are empty on purpose. Arming refuses and names each one
 until it is filled, and a plausible default would be worse than no value because
@@ -67,6 +75,34 @@ default and all Cartesian modes are locked by the interface itself.**
 
 ---
 
+## 1b. Install and configure (Jetson)
+
+```bash
+git clone -b kuka-astra-review https://github.com/intuitionlabs-dev/GPT-as-Policy.git
+cd GPT-as-Policy
+python3 -m venv .venv && ./.venv/bin/pip install ruckig pytest
+./.venv/bin/python -m pytest hybrid_rollout/robodojo/kuka -q     # expect 281 passed
+```
+
+`ruckig` is required — the build refuses to arm without it and will not
+substitute another motion profile.
+
+**Collect the measured values** (guided; collects and validates, never infers):
+```bash
+./.venv/bin/python -m hybrid_rollout.robodojo.kuka.cli measure --checklist
+./.venv/bin/python -m hybrid_rollout.robodojo.kuka.cli measure \
+    --operator "<your name>" --out deployment_config.json
+./.venv/bin/python -m hybrid_rollout.robodojo.kuka.cli gonogo --json
+```
+
+**Camera mapping** — identify which physical camera is which before entering it.
+Nodes 1 and 3 are metadata and are refused:
+```bash
+v4l2-ctl --list-devices
+ffplay /dev/video0     # look at it; is this base or wrist?
+# then record e.g. {"base": 0, "wrist": 2}
+```
+
 ## 2. Phases, in order — none skippable
 
 | phase | what | robot | gate |
@@ -78,6 +114,17 @@ default and all Cartesian modes are locked by the interface itself.**
 | 5 | Astra-direct | moving | **blocked — see §4** |
 
 ---
+
+## 2b. Dry replay and shadow
+
+```bash
+# recorded episodes only, no robot, no cameras
+python3 -m hybrid_rollout.robodojo.kuka.cli phase1 --manifest <ep>/manifest.json \
+    --media-root <ep> --state-json <ep>/state.json --trajectory-json <ep>/trajectory.json
+
+# live cameras, arm idle, commands structurally impossible
+python3 -m hybrid_rollout.robodojo.kuka.cli phase2 --manifest <ep>/manifest.json
+```
 
 ## 3. HOLD checklist — the first real-robot step
 
@@ -97,6 +144,34 @@ controller, so going quiet is a failure mode, not a safe state.**
 
 **The hardware E-stop is authoritative. Software may observe and refuse; it never
 clears or bypasses it. No code path here writes E-stop state.**
+
+### Supervised single-prefix trial (only after HOLD is clean)
+
+`gonogo` must read GO for `supervised_student_prefix`, then an operator arms
+**locally** — confirming the E-stop is reachable and the area is clear. Arming is
+refused remotely, refused without preflight, and refused without a deployable
+Ruckig generator and a configured deviation monitor.
+
+One prefix executes, then the state returns to ARMED by itself.
+
+### Rollback
+
+- **disarm** — `ExecutionController.disarm()`; returns to HOLD, still answering
+- **latched FAULT** — needs a human; FAULT outranks HOLD and will not clear itself
+- **abandon the experiment** — stop the loop, then stop the controller-side RSI
+  program via its own trigger. The arm holds its last pose.
+- **the gripper does not roll back with the arm.** It is on a separate bus and
+  holds its last commanded state. Decide explicitly.
+
+### Log collection
+
+| what | where |
+|---|---|
+| per-cycle commanded/interpolated/measured/residual | `DeviationMonitor.history` |
+| state transitions and hold/fault reasons | `ExecutionController.to_log()` |
+| proposals, decisions, validation, observations | `RunStore` — one JSONL per kind |
+| gripper commands, emitted or refused | `GripperController.status()` |
+| GO/NO-GO at time of run | `cli gonogo --json` |
 
 ---
 
