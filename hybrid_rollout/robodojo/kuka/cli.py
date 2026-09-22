@@ -435,7 +435,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     --astra-live is passed. Both are off by default so a first run costs nothing
     and touches nothing.
     """
+    from .pipeline import PolicyPipeline, resolve_mode
     from .transports import AstraReviewSource, LocalPi05ProposalSource
+    from .vlm_backends import VlmConfig, make_backend
     cfg = load_config(args.experiment)
     flat = flatten_config(cfg)
     miss = missing_config(flat, Mode.REVIEWED_EXECUTION)
@@ -458,6 +460,27 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"  checkpoint   : {src.checkpoint_id}")
     print(f"  use_rel_act  : {rel} "
           f"{'OK' if rel is True else '<-- WRONG CHECKPOINT, will refuse'}")
+
+    # --- the VLM gate, when a mode asks for it -----------------------------
+    policy_mode = resolve_mode(args.policy_mode)
+    gate = None
+    if policy_mode.value != "pi05_only":
+        backend = make_backend(args.monitor_backend,
+                               config=VlmConfig(endpoint=args.monitor_url)
+                               if args.monitor_url else None)
+        probe = backend.probe()
+        print(f"  monitor      : {policy_mode.value} via {backend.name} "
+              f"({getattr(backend, 'model', '?')})")
+        print(f"  monitor svc  : {'reachable' if probe.available else 'UNAVAILABLE'}"
+              f" -- {probe.reason[:70]}")
+        if not probe.available and not args.monitor_shadow:
+            print("  REFUSED: gating was requested but no monitor service is "
+                  "reachable. Start one (see vlm_backends.SERVER_EXAMPLES) or "
+                  "run with --monitor-shadow.", file=sys.stderr)
+            return 2
+        gate = PolicyPipeline(policy_mode, backend=backend,
+                              shadow=args.monitor_shadow)
+        print(f"  monitor mode : {'SHADOW (records only)' if gate.shadow else 'GATING'}")
 
     review = AstraReviewSource(
         base_url=args.astra_url, model=args.astra_model,
@@ -503,6 +526,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         rec = loop.step(obs)
         d = rec.decision or {}
         rv = rec.review or {}
+        if gate is not None:
+            g = gate.step(
+                state=s.state, proposed_steps=int(d.get("steps") or 0) or 5,
+                frames=list(obs.get("image_data_urls") or []),
+                state_text=f"joints_deg={[round(v, 2) for v in s.state[:6]]} "
+                           f"gripper={s.state[6]:.3f}",
+                intent_text=f"next {len(s.recorded_chunk)} absolute joint targets",
+                episode_id=ep.m.episode_id, task=ep.m.instruction,
+                proposed_chunk=s.recorded_chunk, frames_meta=s.frames,
+                fk_preview=rec.fk_preview,
+                image_data_urls=list(obs.get("image_data_urls") or []))
+            print(f"      monitor: {g.gate['disposition'] if g.gate else 'n/a'} "
+                  f"steps={g.executed_steps} (baseline {g.baseline_steps})"
+                  f"{' SHADOW' if g.shadow else ''}"
+                  f"{'  ESCALATED' if g.escalated else ''}")
         if rv.get("ok") and rv.get("is_live"):
             answered += 1
             tokens += int((rv.get("usage") or {}).get("total_tokens") or 0)
@@ -515,6 +553,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("      review: dry run -- request built and hashed, not sent")
         elif rv.get("error"):
             print(f"      review: {str(rv['error'])[:150]}")
+    if gate is not None:
+        m = gate.metrics()
+        print(f"\n  monitor: {m['evaluations'] if 'evaluations' in m else m['cycles']} "
+              f"cycle(s), {m['escalations']} escalation(s), "
+              f"{m['rejected_monitor_outputs']} rejected output(s)")
     print(f"\n  audit -> {audit.path}")
     print("  commands sent: 0 (shadow). Astra: "
           + (f"{answered} live review(s) answered, {tokens} total tokens"
@@ -580,6 +623,17 @@ def main(argv=None) -> int:
     rn.add_argument("--astra-model", default="gpt-6-astra")
     rn.add_argument("--astra-key-env", default="OPENAI_API_KEY")
     rn.add_argument("--astra-effort", default="low")
+    rn.add_argument("--policy-mode", default="pi05_only",
+                    help="pi05_only | pi05_local_monitor | "
+                         "pi05_local_monitor_astra (aliases accepted)")
+    rn.add_argument("--monitor-backend", default="unconfigured",
+                    help="mock | a800 | jetson | unconfigured")
+    rn.add_argument("--monitor-url", help="OpenAI-compatible endpoint")
+    rn.add_argument("--monitor-shadow", action="store_true", default=True,
+                    help="record monitor decisions without gating (default)")
+    rn.add_argument("--monitor-gate", dest="monitor_shadow",
+                    action="store_false",
+                    help="LET THE MONITOR GATE. Off by default.")
     rn.add_argument("--astra-live", action="store_true",
                     help="MAKE PAID API CALLS. Off by default.")
     rn.add_argument("--astra-attempts", type=int, default=1,

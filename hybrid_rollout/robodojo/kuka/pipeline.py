@@ -36,6 +36,7 @@ from enum import Enum
 from typing import Any, Callable, Sequence
 
 from .contract import ARM_DIM, MAX_STUDENT_STEPS
+from .packet import build_packet
 from .safety import Mode as ExecutionMode
 from .vlm_backends import BackendProbe, MonitorBackend, UnconfiguredBackend
 from .vlm_monitor import (Disposition, GateDecision, MonitorGate, MonitorPolicy,
@@ -228,7 +229,14 @@ class PolicyPipeline:
              frames: Sequence[str] | None = None, state_text: str = "",
              intent_text: str = "", in_approach_region: bool = False,
              episode_id: str | None = None, task: str | None = None,
-             now: float | None = None) -> CycleOutcome:
+             now: float | None = None,
+             proposed_chunk: Sequence[Sequence[float]] | None = None,
+             frames_meta: dict[str, Any] | None = None,
+             fk_preview: dict[str, Any] | None = None,
+             image_data_urls: Sequence[str] | None = None) -> CycleOutcome:
+        """`proposed_chunk`, `frames_meta`, `fk_preview` and `image_data_urls`
+        are what an escalation forwards to Astra. Without them the reviewer
+        would be judging the scene from the monitor's prose."""
         now = time.time() if now is None else now
         self.cycle += 1
         baseline = max(0, min(int(proposed_steps), self.default_steps))
@@ -266,18 +274,36 @@ class PolicyPipeline:
         escalate = (decision.disposition is Disposition.ESCALATE
                     and self.mode is PolicyMode.PI05_LOCAL_MONITOR_ASTRA)
         astra_out: dict[str, Any] | None = None
+        astra_steps: int | None = None
         handed_back = False
 
         if escalate and self.astra_review is not None:
             self.controller = "astra"
+            # A REVIEW PACKET, not a summary of the monitor's opinion.
+            # Astra has to see what the monitor saw -- the frames and the
+            # proposed trajectory -- or it is being asked to judge a scene from
+            # prose. The shape is `packet.build_packet`, the same one the Astra
+            # client consumes, so a mismatch is a TypeError here rather than a
+            # KeyError swallowed downstream.
             try:
-                astra_out = self.astra_review({
-                    "cycle": self.cycle, "reason": decision.reason,
-                    "reading": decision.reading, "state": list(state),
-                    "episode_id": episode_id, "task": task})
+                pkt = build_packet(
+                    task_instruction=task or "",
+                    observation_id=f"{episode_id or 'ep'}:c{self.cycle:06d}",
+                    state=list(state), chunk=proposed_chunk or [list(state)],
+                    provenance="model_predicted", frames=frames_meta or {},
+                    fk_preview=fk_preview)
+                pkt["escalation"] = {
+                    "cause": decision.reason,
+                    "monitor_reading": decision.reading,
+                    "adverse_streak": decision.adverse_streak,
+                    "uncertain_streak": decision.uncertain_streak}
+                if image_data_urls:
+                    pkt["image_data_urls"] = list(image_data_urls)
+                astra_out = self.astra_review(pkt)
             except Exception as exc:                               # noqa: BLE001
                 astra_out = {"ok": False,
                              "error": f"{type(exc).__name__}: {exc}"[:180]}
+            astra_steps = self._astra_steps(astra_out, proposed_steps)
         elif self.controller == "astra":
             ok, why = self.gate.may_hand_back()
             if ok:
@@ -285,9 +311,23 @@ class PolicyPipeline:
                 self.controller = "pi05"
                 handed_back = True
 
-        # SHADOW: record the decision, execute the unchanged baseline.
-        executed = baseline if self.shadow else decision.execute_steps
+        # Who decides how many steps run?
+        #   shadow           -> nobody; the unchanged baseline executes
+        #   astra in control -> Astra's clamped answer, falling back to the
+        #                       monitor's number when it gave nothing usable
+        #   otherwise        -> the monitor gate
+        gated = decision.execute_steps
+        if astra_steps is not None:
+            gated = astra_steps
+        executed = baseline if self.shadow else gated
         reason = decision.reason
+        if astra_steps is not None:
+            reason = (f"astra reviewed and governs this cycle: {astra_steps} "
+                      f"step(s). {decision.reason}")
+        elif escalate and astra_out is not None:
+            reason = (f"ESCALATED but Astra returned nothing usable "
+                      f"({astra_out.get('error') or 'no decision'}); falling "
+                      f"back to the monitor's {gated} step(s). {decision.reason}")
         if self.shadow and executed != decision.execute_steps:
             reason = (f"SHADOW: would have executed {decision.execute_steps}, "
                       f"actually executed the unchanged baseline {executed}. "
@@ -299,6 +339,29 @@ class PolicyPipeline:
             escalate, astra_out is not None, astra_out, handed_back,
             self.controller, self.shadow, reason, episode_id, task,
             reading.latency_s if reading else None))
+
+    def _astra_steps(self, astra_out: dict[str, Any] | None,
+                     proposed_steps: int) -> int | None:
+        """Astra's answer GOVERNS while it holds control -- but is clamped.
+
+        Returning None means Astra gave nothing usable, and the caller must fall
+        back to the monitor's (already conservative) number rather than assume
+        permission.
+        """
+        if not astra_out or not astra_out.get("ok"):
+            return None
+        d = astra_out.get("decision") or astra_out
+        mode = str(d.get("mode", ""))
+        if mode == "stop":
+            return 0
+        if mode not in ("student", "edit", "astra_direct_joint"):
+            return None
+        steps = d.get("steps")
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            return None
+        # Same ceilings as the monitor path. A reviewer is not exempt.
+        return max(0, min(steps, MAX_STUDENT_STEPS, int(proposed_steps),
+                          self.gate.chunk_steps))
 
     def _record(self, out: CycleOutcome) -> CycleOutcome:
         self.records.append(out)

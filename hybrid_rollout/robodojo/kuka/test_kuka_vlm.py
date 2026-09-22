@@ -552,3 +552,160 @@ class TestOfflineIntegration:
         assert all(r.executed_steps == r.baseline_steps for r in p.records)
         assert p.metrics()["gate"]["dispositions"].get("escalate", 0) >= 1, \
             "the gate still RECORDS what it would have done"
+
+
+class TestEscalationUsesTheRealAstraContract:
+    """The defect these exist to prevent.
+
+    The first implementation handed Astra a dict I invented -- {cycle, reason,
+    reading, state, episode_id, task} -- while the real client reads
+    packet["user_text"], packet["system"] and packet["response_schema"]. Plugged
+    into the actual client that is a KeyError, which the pipeline caught and
+    recorded as {"ok": false}. Escalations would have failed silently, with
+    Astra never seeing a frame or a trajectory.
+
+    The tests that let it through used `lambda pkt: {"ok": True}`, which accepts
+    any shape. These use the REAL client instead, so a mismatch fails here.
+    """
+
+    def _pipeline(self, seen, *, answer=None):
+        from .transports import AstraReviewSource
+
+        def real_reviewer(pkt):
+            seen.append(pkt)
+            # The genuine client. If `pkt` is the wrong shape this raises.
+            src = AstraReviewSource(base_url="https://unused", model="m",
+                                    api_key_env="NOPE")
+            src.build_body(pkt, pkt.get("image_data_urls"))
+            return answer or {"ok": True,
+                              "decision": {"mode": "student", "steps": 2}}
+
+        return PolicyPipeline(
+            "pi05_local_monitor_astra",
+            backend=MockMonitorBackend([reading(progress="failed")] * 4),
+            policy=MonitorPolicy(escalate_after_adverse=2,
+                                 max_reading_age_s=60.0),
+            astra_review=real_reviewer, shadow=False)
+
+    def _escalate(self, p, **extra):
+        t = time.time()
+        for i in range(2):
+            out = p.step(state=STATE, proposed_steps=10, now=t + i,
+                         task="open the white dishwasher on the table",
+                         episode_id="ep000000", **extra)
+        return out
+
+    def test_packet_is_accepted_by_the_real_client(self):
+        seen = []
+        out = self._escalate(self._pipeline(seen),
+                             proposed_chunk=[[0.0] * 7] * 50)
+        assert out.escalated is True
+        assert len(seen) == 1
+        assert out.astra_decision and out.astra_decision.get("ok") is True, \
+            "a KeyError here would have been recorded as ok=false"
+
+    def test_packet_carries_system_prompt_and_schema(self):
+        seen = []
+        self._escalate(self._pipeline(seen), proposed_chunk=[[0.0] * 7] * 50)
+        pkt = seen[0]
+        for key in ("system", "user_text", "response_schema"):
+            assert key in pkt, f"the real client reads packet[{key!r}]"
+
+    def test_packet_carries_the_proposed_trajectory(self):
+        seen = []
+        chunk = [[float(i)] * 7 for i in range(50)]
+        self._escalate(self._pipeline(seen), proposed_chunk=chunk)
+        assert "t+00" in seen[0]["user_text"], "the chunk must be visible"
+
+    def test_packet_carries_the_frames(self):
+        seen = []
+        self._escalate(self._pipeline(seen), proposed_chunk=[[0.0] * 7] * 50,
+                       frames_meta={"base": {"frame_index": 7,
+                                             "frame_path": "/f/base.png",
+                                             "frame_present": True}},
+                       image_data_urls=["data:image/png;base64,AAA"])
+        pkt = seen[0]
+        assert "base" in pkt["frames"]
+        assert pkt["image_data_urls"] == ["data:image/png;base64,AAA"]
+
+    def test_packet_states_why_it_escalated(self):
+        seen = []
+        self._escalate(self._pipeline(seen), proposed_chunk=[[0.0] * 7] * 50)
+        esc = seen[0]["escalation"]
+        assert esc["cause"] and esc["monitor_reading"]
+        assert esc["adverse_streak"] >= 2
+
+    def test_a_wrong_shape_would_now_be_visible(self):
+        """Guard on the guard: if the packet regressed, this class would fail."""
+        from .transports import AstraReviewSource
+        src = AstraReviewSource(base_url="https://x", model="m", api_key_env="N")
+        with pytest.raises(KeyError):
+            src.build_body({"cycle": 1, "reason": "x", "state": []}, None)
+
+
+class TestAstraAnswerGoverns:
+    """Second defect: Astra's answer only reached the log. While Astra 'had
+    control' the monitor still decided how many steps ran, which made
+    escalation a logging stub."""
+
+    def _run(self, answer, *, proposed=10):
+        p = PolicyPipeline(
+            "pi05_local_monitor_astra",
+            backend=MockMonitorBackend([reading(progress="failed")] * 4),
+            policy=MonitorPolicy(escalate_after_adverse=2,
+                                 max_reading_age_s=60.0),
+            astra_review=lambda pkt: answer, shadow=False)
+        t = time.time()
+        for i in range(2):
+            out = p.step(state=STATE, proposed_steps=proposed, now=t + i,
+                         proposed_chunk=[[0.0] * 7] * 50, task="t",
+                         episode_id="e")
+        return p, out
+
+    def test_astra_steps_are_executed_not_the_monitors(self):
+        _p, out = self._run({"ok": True,
+                             "decision": {"mode": "student", "steps": 4}})
+        assert out.executed_steps == 4
+        assert "astra reviewed and governs" in out.reason
+
+    def test_astra_stop_executes_nothing(self):
+        _p, out = self._run({"ok": True, "decision": {"mode": "stop"}})
+        assert out.executed_steps == 0
+
+    def test_astra_is_clamped_like_everyone_else(self):
+        """A reviewer is not exempt from the bounds."""
+        _p, out = self._run({"ok": True,
+                             "decision": {"mode": "student", "steps": 999}},
+                            proposed=6)
+        assert out.executed_steps == 6, "bounded by proposed_steps"
+
+    def test_unusable_astra_answer_falls_back_conservatively(self):
+        _p, out = self._run({"ok": False, "error": "timeout"})
+        assert "nothing usable" in out.reason
+        assert out.executed_steps <= 3, "falls back to the monitor, not to permission"
+
+    def test_malformed_astra_steps_are_not_trusted(self):
+        _p, out = self._run({"ok": True,
+                             "decision": {"mode": "student", "steps": "four"}})
+        assert "nothing usable" in out.reason
+
+    def test_unknown_astra_mode_is_not_trusted(self):
+        _p, out = self._run({"ok": True,
+                             "decision": {"mode": "teleport", "steps": 3}})
+        assert "nothing usable" in out.reason
+
+    def test_shadow_still_overrides_everything(self):
+        p = PolicyPipeline(
+            "pi05_local_monitor_astra",
+            backend=MockMonitorBackend([reading(progress="failed")] * 4),
+            policy=MonitorPolicy(escalate_after_adverse=2,
+                                 max_reading_age_s=60.0),
+            astra_review=lambda pkt: {"ok": True,
+                                      "decision": {"mode": "student",
+                                                   "steps": 9}},
+            default_steps=5, shadow=True)
+        t = time.time()
+        for i in range(2):
+            out = p.step(state=STATE, proposed_steps=10, now=t + i,
+                         proposed_chunk=[[0.0] * 7] * 50)
+        assert out.executed_steps == out.baseline_steps == 5
