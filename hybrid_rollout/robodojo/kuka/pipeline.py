@@ -10,7 +10,8 @@ COMPAT_ALIASES records the mapping explicitly.
     pi05_only                  pi0.5 proposes; a fixed bounded prefix executes.
                                No monitor, no Astra. This is the existing
                                behaviour and its semantics are unchanged.
-    pi05_local_monitor         a local VLM watches at ~2-5 Hz or on semantic
+    pi05_local_monitor         a local VLM watches at its MEASURED rate (a 2B
+                               on an AGX Orin is ~0.2 Hz, not 2-5) or on semantic
                                events and gates the prefix length. Never calls
                                Astra, never commands.
     pi05_local_monitor_astra   as above, plus escalation to Astra on PERSISTENT
@@ -138,17 +139,69 @@ class Event(str, Enum):
 
 @dataclass(frozen=True)
 class MonitorSchedule:
-    """~2-5 Hz, or on a semantic event. Never every 250 Hz control tick."""
-    min_interval_s: float = 0.20        # 5 Hz ceiling
-    max_interval_s: float = 0.50        # 2 Hz floor
+    """When to look. Never every 250 Hz control tick.
+
+    THE RATE IS BOUNDED BY INFERENCE, NOT BY THIS CLASS. Asking every 0.2 s is
+    meaningless if a reading takes 6 s -- the schedule would simply request the
+    next look before the last one returned, and the effective rate would be
+    whatever the model manages. The defaults below are therefore set from
+    MEASURED device latency, and `effective_hz` reports what is actually
+    achievable so a run cannot quietly believe it is monitoring five times a
+    second when it is monitoring once every six.
+
+    The safety consequence is real and should be stated rather than buried: a
+    slower monitor reacts later. At ~6 s a check, roughly 180 control cycles
+    pass between looks, which is why the deterministic stop conditions -- limits,
+    the staleness watchdog, commanded-vs-measured -- remain the things that
+    actually protect the arm. The monitor is triage, not a safety layer.
+    """
+    min_interval_s: float = 1.0
+    max_interval_s: float = 6.0
     stall_epsilon_deg: float = 0.05     # below this, motion counts as stalled
     stall_cycles: int = 8
+    #: Measured seconds per reading on the target device. None = unmeasured.
+    measured_latency_s: float | None = None
+
+    @classmethod
+    def from_latency(cls, latency_s: float, **kw) -> "MonitorSchedule":
+        """Build a schedule that admits what the device can actually do."""
+        return cls(min_interval_s=max(0.2, latency_s),
+                   max_interval_s=max(1.0, latency_s * 2.0),
+                   measured_latency_s=latency_s, **kw)
+
+    def effective_hz(self) -> float:
+        """What is achievable, not what is requested."""
+        floor = max(self.min_interval_s, self.measured_latency_s or 0.0)
+        return 1.0 / floor if floor else 0.0
+
+    def honest(self) -> tuple[bool, str]:
+        if self.measured_latency_s is None:
+            return False, ("monitor latency has not been measured on this "
+                           "device; the requested rate is an assumption")
+        if self.measured_latency_s > self.min_interval_s + 1e-9:
+            return False, (f"requested up to {1.0/self.min_interval_s:.1f} Hz but "
+                           f"a reading takes {self.measured_latency_s:.2f}s, so "
+                           f"the real rate is {self.effective_hz():.2f} Hz")
+        return True, "requested rate is achievable at the measured latency"
 
     def to_log(self) -> dict[str, Any]:
         d = asdict(self)
-        d.update({"schema": SCHEMA, "hz_range": [1.0 / self.max_interval_s,
-                                                 1.0 / self.min_interval_s]})
+        ok, why = self.honest()
+        d.update({"schema": SCHEMA,
+                  "requested_hz_range": [
+                      (1.0 / self.max_interval_s) if self.max_interval_s else None,
+                      (1.0 / self.min_interval_s) if self.min_interval_s else None],
+                  "effective_hz": round(self.effective_hz(), 3),
+                  "rate_is_honest": ok, "rate_note": why,
+                  "control_cycles_between_looks": int(
+                      (self.measured_latency_s or self.max_interval_s) * 250)})
         return d
+
+
+# Which event wins when several occur inside one rate-limited window.
+_SEVERITY = {Event.PERIODIC: 0, Event.APPROACH_REGION: 1,
+             Event.STALLED_MOTION: 2, Event.GRIPPER_OPEN: 3,
+             Event.GRIPPER_CLOSE: 4}
 
 
 class EventDetector:
@@ -160,6 +213,8 @@ class EventDetector:
         self.last_state: list[float] | None = None
         self.still_cycles = 0
         self.last_gripper: float | None = None
+        self.pending: Event | None = None   # semantic event seen while rate-limited
+        self.deferred_events = 0            # how often that happened (reported)
 
     def due(self, *, state: Sequence[float], now: float | None = None,
             in_approach_region: bool = False) -> tuple[bool, Event | None]:
@@ -186,10 +241,26 @@ class EventDetector:
 
         self.last_state, self.last_gripper = s, grip
         elapsed = None if self.last_eval is None else now - self.last_eval
-        if event is not None and (elapsed is None
-                                  or elapsed >= self.sched.min_interval_s):
+
+        # A semantic event that arrives while we are rate-limited is HELD, not
+        # dropped. The monitor cannot be re-entered faster than one inference
+        # (~6 s on the Jetson), but "the model is busy" must never become "the
+        # gripper closed and nobody looked" -- the gripper is driven over Modbus
+        # straight from the Jetson, so RSI STOPFLAG does not stop it. The event
+        # survives to the next look; only its TIMELINESS degrades, and that is
+        # counted so the delay is visible rather than silent.
+        if event is not None:
+            if self.pending is None or _SEVERITY[event] > _SEVERITY[self.pending]:
+                self.pending = event
+
+        ready = elapsed is None or elapsed >= self.sched.min_interval_s
+        if self.pending is not None and ready:
+            held, self.pending = self.pending, None
             self.last_eval = now
-            return True, event
+            return True, held
+        if self.pending is not None:
+            self.deferred_events += 1
+            return False, None
         if elapsed is None or elapsed >= self.sched.max_interval_s:
             self.last_eval = now
             return True, Event.PERIODIC
@@ -459,6 +530,10 @@ class PolicyPipeline:
                 "mean": round(sum(lat) / len(lat), 4) if lat else None,
                 "max": round(max(lat), 4) if lat else None},
             "gate": self.gate.metrics(),
+            # Events that occurred while the monitor was mid-inference. They
+            # were delivered late, not dropped -- but a large number here means
+            # the model is too slow for the motion it is watching.
+            "events_deferred_by_monitor_latency": self.events.deferred_events,
             "schedule": self.events.sched.to_log(),
             "compat_aliases": {k: v.value for k, v in COMPAT_ALIASES.items()},
             "compat_note": COMPAT_NOTE,

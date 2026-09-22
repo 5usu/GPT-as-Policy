@@ -3,7 +3,8 @@
 WHERE THIS SITS
     pi0.5 proposes a 50-step chunk   (fast, the primary policy)
       -> this monitor watches recent frames + deterministic state + the intended
-         trajectory, at ~2-5 Hz or on semantic events
+         trajectory, paced by MEASURED inference latency (~0.2 Hz for a 2B
+         on an AGX Orin) and on semantic events
       -> it returns a STATUS, and a bounded number of steps it is willing to see
          executed, and whether to escalate
       -> Astra is called only on persistent evidence of failure or misalignment

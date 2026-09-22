@@ -5,19 +5,22 @@ The controller must not care whether the monitor is vLLM, llama.cpp, Ollama,
 transformers-serve or a mock. Two very different machines have to run the same
 typed contract:
 
-  A800 (default)  Qwen3-VL-2B-Instruct. Small enough to sit beside other work on
-                  an 80 GB card and still answer at a few Hz; a 2B VLM is chosen
-                  over anything larger because this job is *monitoring* -- read a
-                  scene, report a status -- not reasoning about corrections. The
-                  reasoning job belongs to Astra, and only on escalation.
+ONE MODEL, ON THE JETSON: Qwen3-VL-2B-Instruct.
 
-  Jetson (edge)   SmolVLM2-500M-Video-Instruct. Video-instruct matters: the
-                  monitor's decisions depend on CHANGE between frames, and a
-                  model built for a single image tends to describe a still.
-                  500M keeps headroom on a board already running the RSI loop.
+A 2B VLM is chosen over anything larger because this job is *monitoring* -- read
+a scene, report a status -- not reasoning about corrections. The reasoning job
+belongs to Astra, and only on escalation. On an AGX Orin 64 GB, 2B at Q8 is
+~2.2 GB, so memory is not the constraint; LATENCY IS, and it must be measured on
+the device rather than assumed.
 
-Both speak the same `MonitorBackend` protocol, so swapping one for the other is a
-configuration change and the controller is untouched.
+The monitor cannot live on the A800. That box exposes no HTTP port, has no
+Tailscale, cannot reach the public internet, and sits behind a link measured at
+~26 KB/s with 20% packet loss -- a single four-frame payload takes ~27 s against
+a 3 s budget. A WAN hop inside a motion-gating loop would also mean the arm stops
+whenever the link hiccups.
+
+The `MonitorBackend` protocol is unchanged, so a different model remains a
+configuration change.
 
 NOTHING HERE DOWNLOADS WEIGHTS OR INSTALLS A RUNTIME. The HTTP client assumes an
 OpenAI-compatible server the operator started themselves; `probe()` reports
@@ -36,20 +39,41 @@ from .vlm_monitor import MonitorReading, MonitorRejected, parse_reading, respons
 
 SCHEMA = "hybrid_rollout.robodojo.kuka.vlm_backends.v1"
 
-DEFAULT_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
-EDGE_MODEL = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+#: One model everywhere. The monitor runs ON THE JETSON -- it must, because the
+#: A800 is a rented cloud box reachable only over a WAN measured at ~26 KB/s with
+#: 20% loss, where a single four-frame payload takes ~27 s against a 3 s budget.
+#: A remote monitor was never viable for a loop that gates motion.
+MONITOR_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
+DEFAULT_MODEL = MONITOR_MODEL
+EDGE_MODEL = MONITOR_MODEL          # same model; the Jetson AGX Orin 64GB fits it
+
+#: Dropped as the edge default at the operator's direction. Recorded because the
+#: reason matters: the shadow run that showed SmolVLM2-500M returning uniform
+#: uncertain/uncertain/confidence-0.0 was OUR wiring -- viewpoints labelled as
+#: time, and a trajectory sent as a word count. That run is NOT evidence the
+#: model was inadequate, and it was never re-run after the fix. Choosing the 2B
+#: is a capacity decision taken without a comparison, not a measured verdict.
+RETIRED_EDGE_MODEL = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+RETIRED_REASON = ("operator direction; the 500M was never evaluated on corrected "
+                  "inputs, so no quality comparison exists")
 
 #: Documentation only. This module never runs these.
 SERVER_EXAMPLES = {
-    "a800_vllm": (
+    "jetson_vllm": (
         "vllm serve Qwen/Qwen3-VL-2B-Instruct --port 8020 "
-        "--max-model-len 8192 --limit-mm-per-prompt image=4"),
-    "a800_transformers": (
+        "--max-model-len 4096 --limit-mm-per-prompt image=4 "
+        "--gpu-memory-utilization 0.45"),
+    "jetson_llama_cpp": (
+        "llama-server -m Qwen3-VL-2B-Instruct-Q8_0.gguf "
+        "--mmproj mmproj-Qwen3-VL-2B.gguf --port 8020 -ngl 99"),
+    "jetson_transformers": (
         "python -m transformers.serve --model Qwen/Qwen3-VL-2B-Instruct "
         "--port 8020"),
-    "jetson_llama_cpp": (
-        "llama-server -m SmolVLM2-500M-Video-Instruct-Q8_0.gguf "
-        "--mmproj mmproj-SmolVLM2-500M.gguf --port 8020"),
+    "measure_first": (
+        "Before wiring it in, time one request at the power mode you will "
+        "actually run: the 500M took 3.05 s at MODE_30W/612 MHz, and a 2B is "
+        "not 4x that but it is not free either. Set monitor_timeout_s from the "
+        "measurement, not from hope."),
     "note": ("Start one of these yourself. This package neither installs a "
              "runtime nor fetches weights; it detects whether a service is "
              "reachable and refuses to gate motion when it is not."),
@@ -151,26 +175,35 @@ class MockMonitorBackend:
 
 @dataclass
 class VlmConfig:
-    """Non-secret settings. A key, if any, is read from the environment by name."""
+    """Non-secret settings. A key, if any, is read from the environment by name.
+
+    `timeout_s` IS A DECLARATION ABOUT THE DEVICE, NOT A PREFERENCE. Set it from
+    a measurement at the power mode you will actually run. Too low and every
+    reading fail-safes to HOLD; too high and the monitor silently stops keeping
+    up with the arm while appearing to work.
+    """
     endpoint: str = "http://127.0.0.1:8020/v1/chat/completions"
-    model: str = DEFAULT_MODEL
+    model: str = MONITOR_MODEL
     api_key_env: str = "LOCAL_VLM_API_KEY"
-    timeout_s: float = 2.0
-    max_frames: int = 3
+    timeout_s: float = 6.0
+    max_frames: int = 4               # t-1 and t, both cameras
     temperature: float = 0.0
     health_path: str = "/v1/models"
 
     @classmethod
-    def edge(cls) -> "VlmConfig":
-        """Jetson-class defaults.
+    def jetson(cls, *, timeout_s: float = 6.0) -> "VlmConfig":
+        """Jetson AGX Orin 64 GB running Qwen3-VL-2B.
 
-        max_frames=4 so a real temporal pair (t-1 and t, both cameras) fits;
-        the earlier 2 could only ever carry one instant. timeout_s stays 3.0
-        deliberately: raising it would hide latency rather than reduce it, and
-        the response cap plus a power-mode decision are the honest levers. Pass
-        a larger value explicitly if you accept a slower monitor.
+        6 s is a STARTING POINT chosen to be honest rather than flattering: the
+        500M measured 3.05 s at MODE_30W, a 2B is larger, and a timeout that
+        fails every cycle teaches nothing. Measure on the device and tighten it.
+        The evidence cap (120 chars) already removed most of the decode cost,
+        which is where extra parameters hurt most.
         """
-        return cls(model=EDGE_MODEL, timeout_s=3.0, max_frames=4)
+        return cls(model=MONITOR_MODEL, timeout_s=timeout_s, max_frames=4)
+
+    # Retained so existing callers keep working; both now mean the same thing.
+    edge = jetson
 
     def to_log(self) -> dict[str, Any]:
         d = asdict(self)
@@ -300,13 +333,20 @@ class OpenAICompatibleBackend:
                              latency_s=round(latency, 4))
 
 
+#: Backend names describe WHERE THE SERVICE IS, not which machine owns the GPU.
+#: The old "a800" label was misleading once the monitor moved onto the Jetson:
+#: it named a host that cannot serve this at all.
+BACKEND_KINDS = ("local", "mock", "unconfigured")
+DEPRECATED_KINDS = {"a800": "local", "jetson": "local", "edge": "local",
+                    "default": "local", "openai_compatible": "local"}
+
+
 def make_backend(kind: str = "unconfigured", *,
                  config: VlmConfig | None = None,
                  readings: Sequence[Any] | None = None) -> MonitorBackend:
+    kind = DEPRECATED_KINDS.get(kind, kind)
     if kind == "mock":
         return MockMonitorBackend(readings or [])
-    if kind in ("a800", "default", "openai_compatible"):
-        return OpenAICompatibleBackend(config or VlmConfig())
-    if kind in ("jetson", "edge"):
-        return OpenAICompatibleBackend(config or VlmConfig.edge())
+    if kind == "local":
+        return OpenAICompatibleBackend(config or VlmConfig.jetson())
     return UnconfiguredBackend()

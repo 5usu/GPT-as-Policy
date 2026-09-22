@@ -19,6 +19,18 @@ from .vlm_monitor import (Disposition, MonitorGate, MonitorPolicy, MonitorReject
 STATE = [-76.55, -94.75, 66.60, 8.53, 19.30, 5.19, 0.0]
 
 
+def fast_schedule():
+    """Evaluate on every synthetic tick.
+
+    The shipped default is paced from MEASURED device latency (~6 s for a 2B on
+    an AGX Orin), so a test advancing `now` by one second would never come due.
+    These tests exercise gate logic, not scheduling; TestSchedulingStaysOutOfThe
+    ControlLoop covers the real pacing.
+    """
+    return MonitorSchedule(min_interval_s=1e-6, max_interval_s=1e-6,
+                           measured_latency_s=1e-6)
+
+
 def reading(**over):
     r = {"phase": "approach", "progress": "normal", "target_visible": True,
          "grasp_confirmed": False, "slip_detected": False, "intent": "aligned",
@@ -202,6 +214,7 @@ class TestFailSafe:
 
     def test_malformed_response_reaches_fail_safe_through_the_pipeline(self):
         p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend([{"garbage": True}]),
                            shadow=False)
         out = p.step(state=STATE, proposed_steps=10)
@@ -209,6 +222,7 @@ class TestFailSafe:
 
     def test_backend_exception_reaches_fail_safe(self):
         p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend([], fail_with="conn refused"),
                            shadow=False)
         out = p.step(state=STATE, proposed_steps=10)
@@ -244,6 +258,7 @@ class TestModeRouting:
     def test_local_monitor_never_calls_astra(self):
         calls = []
         p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(
                                [reading(progress="failed")] * 6),
                            astra_review=lambda pkt: calls.append(pkt),
@@ -261,6 +276,7 @@ class TestModeRouting:
         # call the later readings stale. See
         # test_fabricated_future_now_trips_the_freshness_check.
         p = PolicyPipeline("pi05_local_monitor_astra",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(
                                [reading(progress="failed")] * 4),
                            policy=MonitorPolicy(escalate_after_adverse=3,
@@ -284,6 +300,7 @@ class TestModeRouting:
         must not be used to justify a takeover.
         """
         p = PolicyPipeline("pi05_local_monitor_astra",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(
                                [reading(progress="failed")] * 3),
                            policy=MonitorPolicy(escalate_after_adverse=2,
@@ -304,6 +321,7 @@ class TestModeRouting:
 
     def test_astra_mode_needs_a_reviewer(self):
         p = PolicyPipeline("pi05_local_monitor_astra",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend([reading()]))
         ok, blockers = p.preflight()
         assert any("Astra" in b for b in blockers)
@@ -316,6 +334,7 @@ class TestShadowIsDefault:
 
     def test_shadow_does_not_alter_the_executed_prefix(self):
         p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(
                                [reading(progress="failed", execute_steps=0)]),
                            default_steps=5, shadow=True)
@@ -326,6 +345,7 @@ class TestShadowIsDefault:
 
     def test_gating_requires_explicit_switch(self):
         p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(
                                [reading(progress="failed", execute_steps=0)]),
                            default_steps=5, shadow=False)
@@ -334,9 +354,25 @@ class TestShadowIsDefault:
 
 
 class TestSchedulingStaysOutOfTheControlLoop:
-    def test_rate_is_2_to_5_hz(self):
-        s = MonitorSchedule()
-        assert 2.0 <= 1.0 / s.max_interval_s and 1.0 / s.min_interval_s <= 5.0
+    def test_unmeasured_rate_is_declared_dishonest(self):
+        """The default cannot claim a rate it has not measured on the device."""
+        ok, why = MonitorSchedule().honest()
+        assert ok is False and "has not been measured" in why
+
+    def test_measured_latency_sets_the_real_rate(self):
+        s = MonitorSchedule.from_latency(6.0)
+        assert s.honest()[0] is True
+        assert s.effective_hz() == pytest.approx(1 / 6.0, abs=0.01)
+
+    def test_a_rate_faster_than_inference_is_called_out(self):
+        s = MonitorSchedule(min_interval_s=0.2, measured_latency_s=6.0)
+        ok, why = s.honest()
+        assert ok is False and "real rate is" in why
+
+    def test_the_cost_of_a_slow_monitor_is_reported(self):
+        d = MonitorSchedule.from_latency(6.0).to_log()
+        assert d["control_cycles_between_looks"] == 1500, \
+            "how many 250 Hz cycles pass between looks must be visible"
 
     def test_not_evaluated_every_tick(self):
         d = EventDetector(MonitorSchedule(min_interval_s=0.2, max_interval_s=0.5))
@@ -349,8 +385,33 @@ class TestSchedulingStaysOutOfTheControlLoop:
         t = time.time()
         d.due(state=STATE, now=t)
         closed = list(STATE[:6]) + [1.0]
-        ok, ev = d.due(state=closed, now=t + 0.3)
+        ok, ev = d.due(state=closed, now=t + 2.0)
         assert ok and ev is Event.GRIPPER_CLOSE
+
+    def test_a_gripper_close_during_inference_is_held_not_dropped(self):
+        """The model cannot be re-entered mid-inference, but the event must
+        still arrive. The gripper is on direct Modbus -- STOPFLAG does not
+        stop it -- so a close nobody looked at is the dangerous case."""
+        d = EventDetector()
+        t = time.time()
+        d.due(state=STATE, now=t)                       # first look consumes
+        closed = list(STATE[:6]) + [1.0]
+        ok, ev = d.due(state=closed, now=t + 0.3)       # inside min_interval
+        assert (ok, ev) == (False, None), "cannot re-enter a busy model"
+        ok, ev = d.due(state=closed, now=t + 1.2)       # next opportunity
+        assert ok and ev is Event.GRIPPER_CLOSE, "the event must survive"
+        assert d.deferred_events == 1, "the delay must be counted, not silent"
+
+    def test_the_more_severe_held_event_wins(self):
+        d = EventDetector()
+        t = time.time()
+        d.due(state=STATE, now=t)
+        d.due(state=STATE, now=t + 0.1, in_approach_region=True)
+        closed = list(STATE[:6]) + [1.0]
+        d.due(state=closed, now=t + 0.2)
+        ok, ev = d.due(state=closed, now=t + 1.2)
+        assert ok and ev is Event.GRIPPER_CLOSE, \
+            "approach must not displace a contact event"
 
     def test_stall_is_detected(self):
         d = EventDetector(MonitorSchedule(stall_cycles=3, min_interval_s=0.0))
@@ -363,9 +424,16 @@ class TestSchedulingStaysOutOfTheControlLoop:
 
 
 class TestBackends:
-    def test_model_choices_recorded(self):
-        assert DEFAULT_MODEL == "Qwen/Qwen3-VL-2B-Instruct"
-        assert EDGE_MODEL == "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+    def test_one_model_everywhere_and_it_runs_on_the_jetson(self):
+        from .vlm_backends import MONITOR_MODEL
+        assert MONITOR_MODEL == "Qwen/Qwen3-VL-2B-Instruct"
+        assert DEFAULT_MODEL == EDGE_MODEL == MONITOR_MODEL
+
+    def test_the_retired_model_records_why_not_just_that(self):
+        """It was retired by direction, not by measurement -- say so."""
+        from .vlm_backends import RETIRED_EDGE_MODEL, RETIRED_REASON
+        assert "SmolVLM2" in RETIRED_EDGE_MODEL
+        assert "never evaluated on corrected inputs" in RETIRED_REASON
 
     def test_default_backend_refuses(self):
         b = UnconfiguredBackend()
@@ -373,11 +441,13 @@ class TestBackends:
         with pytest.raises(MonitorRejected):
             b.observe()
 
-    def test_edge_config_swaps_model_without_controller_change(self):
-        a = make_backend("a800")
-        j = make_backend("jetson")
-        assert a.model == DEFAULT_MODEL and j.model == EDGE_MODEL
-        assert type(a) is type(j), "same client, different configuration"
+    def test_host_named_aliases_still_resolve(self):
+        """a800/jetson named a MACHINE; the monitor runs locally on the Jetson
+        and the A800 cannot serve it at all. Aliases keep callers working."""
+        from .vlm_backends import DEPRECATED_KINDS
+        for old in ("a800", "jetson", "edge"):
+            assert DEPRECATED_KINDS[old] == "local"
+            assert make_backend(old).model == DEFAULT_MODEL
 
     def test_probe_detects_a_missing_service(self):
         def boom(url, body, timeout):
@@ -439,6 +509,7 @@ class TestMetricsAreAuditable:
     def test_records_every_required_field(self):
         rows = []
         p = PolicyPipeline("pi05_local_monitor_astra",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend([reading()]),
                            astra_review=lambda pkt: {"ok": True},
                            on_record=rows.append)
@@ -450,8 +521,16 @@ class TestMetricsAreAuditable:
                   "episode_id", "task", "monitor_latency_s"):
             assert k in row, k
 
+    def test_metrics_surface_late_events(self):
+        """Counting a deferral is pointless if nobody can see it."""
+        p = PolicyPipeline("pi05_local_monitor", schedule=fast_schedule(),
+                           backend=MockMonitorBackend([reading()] * 4))
+        p.events.deferred_events = 7
+        assert p.metrics()["events_deferred_by_monitor_latency"] == 7
+
     def test_metrics_report_clamping_and_streaks(self):
         p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(
                                [reading(execute_steps=99)] * 2), shadow=False)
         t = time.time()
@@ -503,7 +582,8 @@ class TestExistingSafetyPathUntouched:
     def test_monitor_latency_cannot_delay_a_cycle(self):
         """The gate reads a cached decision; it never awaits inference."""
         slow = MockMonitorBackend([reading()], latency_s=5.0)
-        p = PolicyPipeline("pi05_local_monitor", backend=slow, shadow=True)
+        p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(), backend=slow, shadow=True)
         t0 = time.monotonic()
         p.step(state=STATE, proposed_steps=10)
         assert time.monotonic() - t0 < 1.0, "mock must not actually sleep"
@@ -523,7 +603,7 @@ class TestOfflineIntegration:
 
     def test_normal_run_stays_with_pi05(self):
         rows = self._episode()
-        p = PolicyPipeline("pi05_local_monitor_astra",
+        p = PolicyPipeline("pi05_local_monitor_astra", schedule=fast_schedule(),
                            backend=MockMonitorBackend([reading()] * 8),
                            policy=MonitorPolicy(max_reading_age_s=60.0),
                            astra_review=lambda pkt: {"ok": True}, shadow=False)
@@ -541,6 +621,7 @@ class TestOfflineIntegration:
         seq = ([reading()] * 2 + [reading(progress="failed")] * 3
                + [reading()] * 3)
         p = PolicyPipeline("pi05_local_monitor_astra",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(seq),
                            policy=MonitorPolicy(escalate_after_adverse=3,
                                                 hand_back_after_normal=2,
@@ -562,6 +643,7 @@ class TestOfflineIntegration:
         rows = self._episode()
         seq = [reading(progress="failed", execute_steps=0)] * 4
         p = PolicyPipeline("pi05_local_monitor_astra",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(seq),
                            policy=MonitorPolicy(escalate_after_adverse=2,
                                                 max_reading_age_s=60.0),
@@ -602,7 +684,7 @@ class TestEscalationUsesTheRealAstraContract:
                               "decision": {"mode": "student", "steps": 2}}
 
         return PolicyPipeline(
-            "pi05_local_monitor_astra",
+            "pi05_local_monitor_astra", schedule=fast_schedule(),
             backend=MockMonitorBackend([reading(progress="failed")] * 4),
             policy=MonitorPolicy(escalate_after_adverse=2,
                                  max_reading_age_s=60.0),
@@ -671,7 +753,7 @@ class TestAstraAnswerGoverns:
 
     def _run(self, answer, *, proposed=10):
         p = PolicyPipeline(
-            "pi05_local_monitor_astra",
+            "pi05_local_monitor_astra", schedule=fast_schedule(),
             backend=MockMonitorBackend([reading(progress="failed")] * 4),
             policy=MonitorPolicy(escalate_after_adverse=2,
                                  max_reading_age_s=60.0),
@@ -717,7 +799,7 @@ class TestAstraAnswerGoverns:
 
     def test_shadow_still_overrides_everything(self):
         p = PolicyPipeline(
-            "pi05_local_monitor_astra",
+            "pi05_local_monitor_astra", schedule=fast_schedule(),
             backend=MockMonitorBackend([reading(progress="failed")] * 4),
             policy=MonitorPolicy(escalate_after_adverse=2,
                                  max_reading_age_s=60.0),
@@ -770,6 +852,7 @@ class TestShadowRunDefectsAreClosed:
         """Shadow mode with no saved records cannot be evaluated afterwards."""
         rows = []
         p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend([reading()] * 3),
                            policy=MonitorPolicy(max_reading_age_s=60.0),
                            on_record=rows.append, shadow=True)
@@ -785,6 +868,7 @@ class TestShadowRunDefectsAreClosed:
     def test_persisted_record_carries_the_clamp_and_the_reason(self, tmp_path):
         rows = []
         p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(
                                [reading(execute_steps=99)]),
                            policy=MonitorPolicy(max_reading_age_s=60.0),
@@ -801,6 +885,7 @@ class TestAstraRoutingBugs:
 
     def test_pipeline_flags_a_missing_escalation_path(self):
         p = PolicyPipeline("pi05_local_monitor_astra",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend([reading()]))
         ok, blockers = p.preflight()
         assert ok is False
@@ -810,6 +895,7 @@ class TestAstraRoutingBugs:
     def test_local_monitor_mode_has_no_escalation_path_at_all(self):
         """Structural, not a matter of the caller declining to escalate."""
         p = PolicyPipeline("pi05_local_monitor",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(
                                [reading(progress="failed")] * 6),
                            policy=MonitorPolicy(escalate_after_adverse=2,
@@ -826,6 +912,7 @@ class TestAstraRoutingBugs:
         """The cost argument: Astra is reserved for persistence, not polled."""
         calls = []
         p = PolicyPipeline("pi05_local_monitor_astra",
+                           schedule=fast_schedule(),
                            backend=MockMonitorBackend(
                                [reading(progress="failed")] * 6),
                            policy=MonitorPolicy(escalate_after_adverse=3,
@@ -860,15 +947,18 @@ class TestResponseIsCompactForLatency:
         from .vlm_backends import MONITOR_SYSTEM_PROMPT
         assert "120 characters" in MONITOR_SYSTEM_PROMPT
 
-    def test_edge_config_fits_a_real_temporal_pair(self):
+    def test_jetson_config_fits_a_real_temporal_pair(self):
         from .vlm_backends import VlmConfig
-        assert VlmConfig.edge().max_frames >= 4, \
+        assert VlmConfig.jetson().max_frames >= 4, \
             "t-1 and t for two cameras is four images"
 
-    def test_edge_timeout_is_not_quietly_raised(self):
-        """Raising it would hide latency rather than reduce it."""
+    def test_jetson_timeout_is_a_starting_point_to_be_measured(self):
+        """6s is chosen to be honest rather than flattering: a timeout that
+        fails every cycle teaches nothing. It must be tightened from a real
+        measurement on the device."""
         from .vlm_backends import VlmConfig
-        assert VlmConfig.edge().timeout_s == 3.0
+        assert VlmConfig.jetson().timeout_s == 6.0
+        assert VlmConfig.jetson(timeout_s=4.0).timeout_s == 4.0
 
 
 class TestAstraIsNotPolled:
@@ -880,7 +970,7 @@ class TestAstraIsNotPolled:
     def _run(self, recall, ticks=7):
         calls = []
         p = PolicyPipeline(
-            "pi05_local_monitor_astra",
+            "pi05_local_monitor_astra", schedule=fast_schedule(),
             backend=MockMonitorBackend([reading(progress="failed")] * (ticks + 2)),
             policy=MonitorPolicy(escalate_after_adverse=3,
                                  max_reading_age_s=60.0,

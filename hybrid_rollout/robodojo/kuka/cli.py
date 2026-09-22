@@ -465,9 +465,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     policy_mode = resolve_mode(args.policy_mode)
     gate = None
     if policy_mode.value != "pi05_only":
-        backend = make_backend(args.monitor_backend,
-                               config=VlmConfig(endpoint=args.monitor_url)
-                               if args.monitor_url else None)
+        vcfg = VlmConfig.jetson(timeout_s=args.monitor_timeout)
+        if args.monitor_url:
+            vcfg = VlmConfig(endpoint=args.monitor_url, model=vcfg.model,
+                             timeout_s=args.monitor_timeout,
+                             max_frames=vcfg.max_frames)
+        backend = make_backend(args.monitor_backend, config=vcfg)
         probe = backend.probe()
         print(f"  monitor      : {policy_mode.value} via {backend.name} "
               f"({getattr(backend, 'model', '?')})")
@@ -698,7 +701,11 @@ def main(argv=None) -> int:
                     help="pi05_only | pi05_local_monitor | "
                          "pi05_local_monitor_astra (aliases accepted)")
     rn.add_argument("--monitor-backend", default="unconfigured",
-                    help="mock | a800 | jetson | unconfigured")
+                    help="local | mock | unconfigured (a800/jetson are aliases "
+                         "for local and are deprecated: the monitor runs on the "
+                         "Jetson, the A800 cannot serve it)")
+    rn.add_argument("--monitor-timeout", type=float, default=6.0,
+                    help="seconds; set from a MEASURED reading on this device")
     rn.add_argument("--monitor-url", help="OpenAI-compatible endpoint")
     rn.add_argument("--monitor-audit", help="append-only JSONL of monitor records")
     rn.add_argument("--monitor-shadow", action="store_true", default=True,
