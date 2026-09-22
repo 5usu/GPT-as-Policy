@@ -23,7 +23,7 @@ def fast_schedule():
     """Evaluate on every synthetic tick.
 
     The shipped default is paced from MEASURED device latency (~6 s for a 2B on
-    an AGX Orin), so a test advancing `now` by one second would never come due.
+    the device), so a test advancing `now` by one second would never come due.
     These tests exercise gate logic, not scheduling; TestSchedulingStaysOutOfThe
     ControlLoop covers the real pacing.
     """
@@ -1007,3 +1007,24 @@ class TestAstraIsNotPolled:
 
     def test_default_policy_is_transition_only(self):
         assert MonitorPolicy().astra_recall_every == 0
+
+
+class TestHardwareClaimsAreSourced:
+    """A hardware spec nobody reported must not read as a measurement."""
+
+    def test_unidentified_board_is_declared_not_assumed(self):
+        from .vlm_backends import compute_is_known, JETSON_COMPUTE
+        ok, why = compute_is_known()
+        assert ok is False and "placeholder" in why
+        assert JETSON_COMPUTE["board_model"] is None
+        assert "may be assumed" in JETSON_COMPUTE["source"]
+
+    def test_no_board_model_is_hardcoded_anywhere(self):
+        """Regression: 'AGX Orin 64 GB' was asserted without a source."""
+        import pathlib
+        here = pathlib.Path(__file__).parent
+        for f in here.glob("*.py"):
+            text = f.read_text()
+            for claim in ("AGX Orin", "Orin Nano", "Xavier"):
+                assert claim not in text, \
+                    f"{f.name} states a board model; none has been reported"

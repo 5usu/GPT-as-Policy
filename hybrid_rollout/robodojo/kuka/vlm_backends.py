@@ -9,7 +9,8 @@ ONE MODEL, ON THE JETSON: Qwen3-VL-2B-Instruct.
 
 A 2B VLM is chosen over anything larger because this job is *monitoring* -- read
 a scene, report a status -- not reasoning about corrections. The reasoning job
-belongs to Astra, and only on escalation. On an AGX Orin 64 GB, 2B at Q8 is
+belongs to Astra, and only on escalation. THE JETSON MODEL AND MEMORY ARE
+UNKNOWN (see JETSON_COMPUTE); whether a 2B fits, and at what precision, is
 ~2.2 GB, so memory is not the constraint; LATENCY IS, and it must be measured on
 the device rather than assumed.
 
@@ -43,9 +44,34 @@ SCHEMA = "hybrid_rollout.robodojo.kuka.vlm_backends.v1"
 #: A800 is a rented cloud box reachable only over a WAN measured at ~26 KB/s with
 #: 20% loss, where a single four-frame payload takes ~27 s against a 3 s budget.
 #: A remote monitor was never viable for a loop that gates motion.
+#: The board has never been identified. Module/memory decide whether a 2B
+#: runs at all, at what precision, and at what latency -- so the 6 s timeout
+#: and the pacing derived from it are PLACEHOLDERS, not specifications.
+#: Fill these in from the device:
+#:     cat /etc/nv_tegra_release ; cat /proc/device-tree/model ; free -g
+JETSON_COMPUTE = {
+    "board_model": None,          # e.g. "NVIDIA Jetson AGX Orin 64GB"
+    "total_memory_gb": None,
+    "jetpack_l4t": None,
+    "power_mode": None,           # nvpmodel -q  (do NOT change it)
+    "measured_2b_latency_s": None,
+    "source": "not reported from the device; no value here may be assumed",
+}
+
+
+def compute_is_known() -> tuple[bool, str]:
+    """Fail closed: refuse to present latency claims as specifications."""
+    missing = [k for k, v in JETSON_COMPUTE.items()
+               if v is None and k != "source"]
+    if missing:
+        return False, ("Jetson compute unidentified (" + ", ".join(missing) +
+                       "); the 6 s timeout is a placeholder, not a measurement")
+    return True, "Jetson compute reported from the device"
+
+
 MONITOR_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
 DEFAULT_MODEL = MONITOR_MODEL
-EDGE_MODEL = MONITOR_MODEL          # same model; the Jetson AGX Orin 64GB fits it
+EDGE_MODEL = MONITOR_MODEL          # same model everywhere; see JETSON_COMPUTE
 
 #: Dropped as the edge default at the operator's direction. Recorded because the
 #: reason matters: the shadow run that showed SmolVLM2-500M returning uniform
@@ -192,7 +218,7 @@ class VlmConfig:
 
     @classmethod
     def jetson(cls, *, timeout_s: float = 6.0) -> "VlmConfig":
-        """Jetson AGX Orin 64 GB running Qwen3-VL-2B.
+        """The Jetson running Qwen3-VL-2B. Board model UNKNOWN.
 
         6 s is a STARTING POINT chosen to be honest rather than flattering: the
         500M measured 3.05 s at MODE_30W, a 2B is larger, and a timeout that
