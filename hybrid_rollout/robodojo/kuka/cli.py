@@ -488,6 +488,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             mon_f.write(json.dumps(row, default=str) + "\n")
             mon_f.flush()
 
+        # BUG A: the escalation path was never wired -- PolicyPipeline was
+        # built without astra_review, so at escalation the branch was skipped
+        # silently. `_escalate_to_astra` is installed below, after the reviewer
+        # exists.
         gate = PolicyPipeline(policy_mode, backend=backend,
                               shadow=args.monitor_shadow, on_record=_persist)
         print(f"  monitor log  : {mon_path} (append-only)")
@@ -501,6 +505,41 @@ def cmd_run(args: argparse.Namespace) -> int:
     ok, why = review.preflight()
     print(f"  astra        : {'LIVE (PAID)' if args.astra_live else 'DRY RUN'} -- {why}"
           f" [{'streamed' if review.stream else 'single response'}]")
+
+    # BUG B: Astra was installed as the loop's per-tick review source regardless
+    # of policy mode, so pi05_local_monitor -- the mode whose whole purpose is
+    # NOT calling Astra -- called it on every tick. That inverts the design: the
+    # triage layer became pure overhead on top of the cost it exists to avoid.
+    #
+    # Astra is now the loop's reviewer ONLY in the mode that reviews every tick.
+    # In the monitored modes the loop runs unreviewed and Astra is reached
+    # exclusively through escalation.
+    astra_per_tick = policy_mode.value == "pi05_only" or gate is None
+    escalations = {"n": 0}
+
+    def _escalate_to_astra(packet):
+        """Called by PolicyPipeline only on PERSISTENT adverse evidence."""
+        escalations["n"] += 1
+        print(f"      ESCALATING to Astra (#{escalations['n']})")
+        r = review.review(packet)
+        if isinstance(r, dict):
+            return r
+        return {"ok": bool(getattr(r, "decision", None)),
+                "decision": getattr(r, "decision", None),
+                "error": getattr(r, "error", None)}
+
+    if gate is not None:
+        gate.astra_review = _escalate_to_astra
+        if policy_mode.value == "pi05_local_monitor":
+            # This mode must never escalate. Make that structural rather than
+            # relying on the caller not asking for it.
+            gate.astra_review = None
+        pok, pblockers = gate.preflight()
+        print(f"  astra path   : "
+              + ("per-tick review (pi05_only)" if astra_per_tick
+                 else "escalation only -- Astra is NOT called per tick"))
+        if not pok:
+            print(f"  monitor preflight: {'; '.join(pblockers)[:100]}")
     if args.astra_live and not ok:
         print(f"  REFUSED: {why}", file=sys.stderr)
         return 2
@@ -520,7 +559,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     audit = AuditLog(args.audit or "live_loop_audit.jsonl")
     loop = KukaReviewLoop(
         mode=Mode.LIVE_SHADOW, config=flat, raw_config=cfg,
-        proposal_source=src, review_source=review, gateway=ShadowGateway(),
+        proposal_source=src,
+        review_source=review if astra_per_tick else None,
+        gateway=ShadowGateway(),
         fk=fk, audit=audit,
         target=RobotIdentity(ROBOT_MODEL, args.serial or "UNSET",
                              "172.17.255.2", 59152),
@@ -584,6 +625,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"      review: {str(rv['error'])[:150]}")
     if gate is not None:
         m = gate.metrics()
+        print(f"  astra reached via escalation: {escalations['n']} time(s)")
         print(f"\n  monitor: {m['evaluations'] if 'evaluations' in m else m['cycles']} "
               f"cycle(s), {m['escalations']} escalation(s), "
               f"{m['rejected_monitor_outputs']} rejected output(s)")

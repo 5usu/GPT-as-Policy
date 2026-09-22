@@ -19,3 +19,13 @@ auth.json
 !.env.example
 *.log
 .DS_Store
+
+# Run artifacts: audit and monitor logs are append-only records of a session,
+# not source. Always pass --monitor-audit to put them somewhere deliberate;
+# these patterns stop a default-path run dirtying the tree.
+monitor_shadow.jsonl
+*_audit.jsonl
+live_loop_audit.jsonl
+phase*_packets.jsonl
+phase*_astra.jsonl
+phase*_dryrun.jsonl

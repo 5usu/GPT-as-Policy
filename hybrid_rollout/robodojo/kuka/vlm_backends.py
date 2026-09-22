@@ -71,8 +71,9 @@ If you cannot see the target, say so rather than guessing.
 Return only the JSON object described by the schema. `execute_steps` is a \
 REQUEST, not a command: it is clamped independently and a larger number does not \
 widen any limit. `confidence` is advisory and never relaxes a bound. `evidence` \
-must cite what you actually saw; a decision without stated evidence is not \
-auditable.
+must cite what you actually saw, in at most 120 characters -- one short clause, \
+no preamble. Every decision lives in the typed fields, so longer prose adds \
+latency without adding information.
 
 Set escalate=true only for persistent evidence of execution failure or a \
 trajectory that pursues the wrong subgoal. Uncertainty alone is not escalation; \
@@ -161,7 +162,15 @@ class VlmConfig:
 
     @classmethod
     def edge(cls) -> "VlmConfig":
-        return cls(model=EDGE_MODEL, timeout_s=3.0, max_frames=2)
+        """Jetson-class defaults.
+
+        max_frames=4 so a real temporal pair (t-1 and t, both cameras) fits;
+        the earlier 2 could only ever carry one instant. timeout_s stays 3.0
+        deliberately: raising it would hide latency rather than reduce it, and
+        the response cap plus a power-mode decision are the honest levers. Pass
+        a larger value explicitly if you accept a slower monitor.
+        """
+        return cls(model=EDGE_MODEL, timeout_s=3.0, max_frames=4)
 
     def to_log(self) -> dict[str, Any]:
         d = asdict(self)

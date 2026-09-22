@@ -39,6 +39,10 @@ from typing import Any, Sequence
 
 SCHEMA = "hybrid_rollout.robodojo.kuka.vlm_monitor.v1"
 
+#: Evidence is capped tightly because output tokens are the latency. See the
+#: schema comment; this is a speed decision, not a style one.
+EVIDENCE_MAX_CHARS = 120
+
 
 class Progress(str, Enum):
     NORMAL = "normal"
@@ -95,7 +99,12 @@ def response_schema() -> dict[str, Any]:
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "execute_steps": {"type": "integer", "minimum": 0},
             "escalate": {"type": "boolean"},
-            "evidence": {"type": "string", "maxLength": 600},
+            # SHORT ON PURPOSE. Generation dominates latency at 500M, and a
+            # ~117-token reply put the Jetson at 3.05s against a 3.0s limit.
+            # 120 characters is enough to name what was seen and be audited on
+            # it; prose beyond that costs milliseconds per token and adds no
+            # decision content, since every DECISION is in the typed fields.
+            "evidence": {"type": "string", "maxLength": EVIDENCE_MAX_CHARS},
         },
     }
 
@@ -194,7 +203,8 @@ def parse_reading(payload: Any, *, backend: str = "unknown",
         slip_detected=payload["slip_detected"],
         intent=enum(Intent, "intent"), confidence=float(conf),
         execute_steps_raw=int(steps), escalate_requested=payload["escalate"],
-        evidence=ev.strip()[:600], backend=backend, latency_s=latency_s)
+        evidence=ev.strip()[:EVIDENCE_MAX_CHARS], backend=backend,
+        latency_s=latency_s)
 
 
 @dataclass(frozen=True)
@@ -207,6 +217,12 @@ class MonitorPolicy:
     hold_after_uncertain: int = 4       # consecutive uncertain -> stop and look
     max_reading_age_s: float = 1.0      # older than this is stale
     hand_back_after_normal: int = 2     # consecutive good readings to hand back
+    #: While Astra holds control, how often to ASK IT AGAIN. 0 = only on the
+    #: transition into escalation. Calling it every adverse tick is not
+    #: "reserving it for persistent escalation", it is polling an expensive
+    #: reviewer for as long as things look bad -- which is the cost the local
+    #: monitor exists to avoid. A re-ask should be a deliberate cadence.
+    astra_recall_every: int = 0
 
     def ceiling(self, reading: MonitorReading) -> int:
         if reading.phase in (Phase.CONTACT, Phase.GRASP):

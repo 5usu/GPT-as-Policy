@@ -251,6 +251,8 @@ class PolicyPipeline:
         self.on_record = on_record
         self.cycle = 0
         self.controller = "pi05"
+        self._escalated_at = 0
+        self._last_astra_steps: int | None = None
         self.records: list[CycleOutcome] = []
 
     # ------------------------------------------------------------- readiness
@@ -319,7 +321,24 @@ class PolicyPipeline:
         astra_steps: int | None = None
         handed_back = False
 
-        if escalate and self.astra_review is not None:
+        # Astra is asked on the TRANSITION into escalation, and thereafter only
+        # on the configured cadence. Without this it was re-called on every
+        # adverse tick for as long as the condition lasted.
+        already_escalated = self.controller == "astra"
+        recall = self.gate.policy.astra_recall_every
+        due_recall = (already_escalated and recall > 0
+                      and (self.cycle - self._escalated_at) % recall == 0)
+        ask_astra = (escalate and self.astra_review is not None
+                     and (not already_escalated or due_recall))
+        if escalate and not ask_astra and already_escalated:
+            reason_suffix = (f" (Astra already holds control since cycle "
+                             f"{self._escalated_at}; not re-asked)")
+        else:
+            reason_suffix = ""
+
+        if ask_astra:
+            if not already_escalated:
+                self._escalated_at = self.cycle
             self.controller = "astra"
             # A REVIEW PACKET, not a summary of the monitor's opinion.
             # Astra has to see what the monitor saw -- the frames and the
@@ -346,6 +365,10 @@ class PolicyPipeline:
                 astra_out = {"ok": False,
                              "error": f"{type(exc).__name__}: {exc}"[:180]}
             astra_steps = self._astra_steps(astra_out, proposed_steps)
+            self._last_astra_steps = astra_steps
+        elif escalate and already_escalated:
+            # Still escalated, not re-asking. Astra's standing decision holds.
+            astra_steps = self._last_astra_steps
         elif self.controller == "astra":
             ok, why = self.gate.may_hand_back()
             if ok:
@@ -378,8 +401,8 @@ class PolicyPipeline:
         return self._record(CycleOutcome(
             self.mode.value, self.cycle, event.value if event else None,
             proposed_steps, executed, baseline, decision.to_log(), err,
-            escalate, astra_out is not None, astra_out, handed_back,
-            self.controller, self.shadow, reason, episode_id, task,
+            escalate, ask_astra, astra_out, handed_back,
+            self.controller, self.shadow, reason + reason_suffix, episode_id, task,
             reading.latency_s if reading else None))
 
     def _astra_steps(self, astra_out: dict[str, Any] | None,

@@ -793,3 +793,127 @@ class TestShadowRunDefectsAreClosed:
         g = rows[0]["gate"]
         assert g["clamped_from"] == 99
         assert g["execute_steps"] < 99 and g["reason"]
+
+
+class TestAstraRoutingBugs:
+    """Two bugs a Jetson run exposed: escalation was dead, and Astra ran every
+    tick in every mode -- the triage design exactly inverted."""
+
+    def test_pipeline_flags_a_missing_escalation_path(self):
+        p = PolicyPipeline("pi05_local_monitor_astra",
+                           backend=MockMonitorBackend([reading()]))
+        ok, blockers = p.preflight()
+        assert ok is False
+        assert any("Astra" in b for b in blockers), \
+            "a dead escalation path must be visible in preflight"
+
+    def test_local_monitor_mode_has_no_escalation_path_at_all(self):
+        """Structural, not a matter of the caller declining to escalate."""
+        p = PolicyPipeline("pi05_local_monitor",
+                           backend=MockMonitorBackend(
+                               [reading(progress="failed")] * 6),
+                           policy=MonitorPolicy(escalate_after_adverse=2,
+                                                max_reading_age_s=60.0),
+                           astra_review=None, shadow=False)
+        t = time.time()
+        for i in range(4):
+            out = p.step(state=STATE, proposed_steps=10, now=t + i,
+                         proposed_chunk=[[0.0] * 7] * 50)
+        assert out.astra_called is False
+        assert p.metrics()["astra_calls"] == 0
+
+    def test_escalation_fires_exactly_once_not_per_tick(self):
+        """The cost argument: Astra is reserved for persistence, not polled."""
+        calls = []
+        p = PolicyPipeline("pi05_local_monitor_astra",
+                           backend=MockMonitorBackend(
+                               [reading(progress="failed")] * 6),
+                           policy=MonitorPolicy(escalate_after_adverse=3,
+                                                max_reading_age_s=60.0),
+                           astra_review=lambda pkt: (calls.append(pkt),
+                                                     {"ok": True,
+                                                      "decision": {
+                                                          "mode": "student",
+                                                          "steps": 1}})[1],
+                           shadow=False)
+        t = time.time()
+        for i in range(5):
+            p.step(state=STATE, proposed_steps=10, now=t + i,
+                   proposed_chunk=[[0.0] * 7] * 50)
+        assert len(calls) == 1, \
+            f"Astra must fire on escalation only, fired {len(calls)}x in 5 ticks"
+        # and it stays one: sustained failure does not poll. See
+        # TestAstraIsNotPolled, which this assertion originally uncovered.
+
+
+class TestResponseIsCompactForLatency:
+    def test_evidence_is_capped(self):
+        from .vlm_monitor import EVIDENCE_MAX_CHARS, response_schema
+        assert EVIDENCE_MAX_CHARS == 120
+        assert response_schema()["properties"]["evidence"]["maxLength"] == 120
+
+    def test_overlong_evidence_is_truncated_not_rejected(self):
+        r = parse_reading(reading(evidence="x" * 5000))
+        assert len(r.evidence) == 120
+
+    def test_prompt_asks_for_a_short_clause(self):
+        from .vlm_backends import MONITOR_SYSTEM_PROMPT
+        assert "120 characters" in MONITOR_SYSTEM_PROMPT
+
+    def test_edge_config_fits_a_real_temporal_pair(self):
+        from .vlm_backends import VlmConfig
+        assert VlmConfig.edge().max_frames >= 4, \
+            "t-1 and t for two cameras is four images"
+
+    def test_edge_timeout_is_not_quietly_raised(self):
+        """Raising it would hide latency rather than reduce it."""
+        from .vlm_backends import VlmConfig
+        assert VlmConfig.edge().timeout_s == 3.0
+
+
+class TestAstraIsNotPolled:
+    """Found by a test whose expectation was wrong, which exposed a real gap:
+    once escalated, EVERY subsequent adverse tick re-called Astra. That is
+    polling an expensive reviewer for as long as things look bad -- the exact
+    cost the local monitor exists to avoid."""
+
+    def _run(self, recall, ticks=7):
+        calls = []
+        p = PolicyPipeline(
+            "pi05_local_monitor_astra",
+            backend=MockMonitorBackend([reading(progress="failed")] * (ticks + 2)),
+            policy=MonitorPolicy(escalate_after_adverse=3,
+                                 max_reading_age_s=60.0,
+                                 astra_recall_every=recall),
+            astra_review=lambda pkt: (calls.append(pkt),
+                                      {"ok": True,
+                                       "decision": {"mode": "student",
+                                                    "steps": 1}})[1],
+            shadow=False)
+        t = time.time()
+        for i in range(ticks):
+            p.step(state=STATE, proposed_steps=10, now=t + i,
+                   proposed_chunk=[[0.0] * 7] * 50)
+        return p, calls
+
+    def test_default_asks_once_on_the_transition(self):
+        _p, calls = self._run(recall=0)
+        assert len(calls) == 1, "sustained failure must not poll Astra"
+
+    def test_a_cadence_can_be_configured_deliberately(self):
+        _p, calls = self._run(recall=3)
+        assert 1 < len(calls) <= 3
+
+    def test_standing_decision_holds_between_asks(self):
+        p, _calls = self._run(recall=0)
+        later = [r for r in p.records if r.escalated][-1]
+        assert later.astra_called is False, "not re-asked"
+        assert later.executed_steps == 1, "Astra's standing answer still governs"
+
+    def test_the_record_says_it_was_not_re_asked(self):
+        p, _calls = self._run(recall=0)
+        later = [r for r in p.records if r.escalated][-1]
+        assert "not re-asked" in later.reason
+
+    def test_default_policy_is_transition_only(self):
+        assert MonitorPolicy().astra_recall_every == 0
