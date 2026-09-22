@@ -948,16 +948,32 @@ class TestResponseIsCompactForLatency:
         assert "120 characters" in MONITOR_SYSTEM_PROMPT
 
     def test_jetson_config_fits_a_real_temporal_pair(self):
-        from .vlm_backends import VlmConfig
-        assert VlmConfig.jetson().max_frames >= 4, \
-            "t-1 and t for two cameras is four images"
+        """A pair means ONE camera at t-1 and t. Two cameras at one instant is
+        not a time sequence, which is the defect this whole area came from.
 
-    def test_jetson_timeout_is_a_starting_point_to_be_measured(self):
-        """6s is chosen to be honest rather than flattering: a timeout that
-        fails every cycle teaches nothing. It must be tightened from a real
-        measurement on the device."""
+        The default is 2 rather than 4 after measuring on the Jetson: each
+        640x480 frame costs ~310 prompt tokens, and 4 frames made prefill ~6 s
+        of a ~12 s budget. The CLI orders frames [cam t-1, cam t, ...] so the
+        surviving pair after truncation is temporal, never two viewpoints.
+        """
         from .vlm_backends import VlmConfig
-        assert VlmConfig.jetson().timeout_s == 6.0
+        assert VlmConfig.jetson().max_frames >= 2, \
+            "t-1 and t for one camera is two images"
+        assert VlmConfig.jetson().max_frames % 2 == 0, \
+            "an odd budget would truncate a pair to a single frame"
+
+    def test_jetson_timeout_covers_the_measured_latency(self):
+        """The 6 s starting point HAS now been measured and replaced.
+
+        On the Jetson at MODE_30W (GPU 612 MHz, clocks pinned), Qwen3-VL-2B
+        Q8_0 with a 2-frame pair took 5.5-7.0 s over 6 looks, and 9.1 s worst
+        case over an earlier set. At 6 s every reading fail-safed to HOLD. The
+        default must therefore exceed the measured worst case, with margin,
+        and stay overridable for a device that measures differently."""
+        from .vlm_backends import VlmConfig
+        MEASURED_WORST_S = 9.1
+        assert VlmConfig.jetson().timeout_s >= MEASURED_WORST_S, \
+            "a timeout below the measured worst case fail-safes every cycle"
         assert VlmConfig.jetson(timeout_s=4.0).timeout_s == 4.0
 
 

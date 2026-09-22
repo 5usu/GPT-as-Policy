@@ -186,21 +186,26 @@ class VlmConfig:
     model: str = MONITOR_MODEL
     api_key_env: str = "LOCAL_VLM_API_KEY"
     timeout_s: float = 6.0
-    max_frames: int = 4               # t-1 and t, both cameras
+    max_frames: int = 2               # one camera's t-1/t pair; see jetson()
     temperature: float = 0.0
     health_path: str = "/v1/models"
 
     @classmethod
-    def jetson(cls, *, timeout_s: float = 6.0) -> "VlmConfig":
+    def jetson(cls, *, timeout_s: float = 12.0) -> "VlmConfig":
         """Jetson AGX Orin 64 GB running Qwen3-VL-2B.
 
-        6 s is a STARTING POINT chosen to be honest rather than flattering: the
-        500M measured 3.05 s at MODE_30W, a 2B is larger, and a timeout that
-        fails every cycle teaches nothing. Measure on the device and tighten it.
-        The evidence cap (120 chars) already removed most of the decode cost,
-        which is where extra parameters hurt most.
+        12 s comes from MEASUREMENT on this device, replacing the 6 s starting
+        point: at MODE_30W (GPU 612 MHz, clocks pinned) with a 2-frame temporal
+        pair, one observation took 5.1 s min / 6.7 s median / 9.1 s max over 7
+        looks across 2 episodes. At 6 s every reading fail-safed to HOLD.
+
+        WHERE THE TIME GOES, because it decides what to tune next: prefill is
+        ~1.7 s (750 tokens at ~450 tok/s) and generation is ~5.4-7.4 s (about
+        105 tokens at 15-19 tok/s). Generation dominates, so fewer frames buy
+        little further; a shorter response schema, a smaller quant or a higher
+        GPU clock (MAXN needs a reboot) are the levers that remain.
         """
-        return cls(model=MONITOR_MODEL, timeout_s=timeout_s, max_frames=4)
+        return cls(model=MONITOR_MODEL, timeout_s=timeout_s, max_frames=2)
 
     # Retained so existing callers keep working; both now mean the same thing.
     edge = jetson

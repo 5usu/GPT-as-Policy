@@ -22,6 +22,7 @@ import base64
 import json
 import sys
 import time
+from dataclasses import replace as _dc_replace
 from pathlib import Path
 
 from .contract import ROBOT_MODEL, eef_execution_gate
@@ -470,6 +471,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             vcfg = VlmConfig(endpoint=args.monitor_url, model=vcfg.model,
                              timeout_s=args.monitor_timeout,
                              max_frames=vcfg.max_frames)
+        if args.monitor_frames:
+            vcfg = _dc_replace(vcfg, max_frames=args.monitor_frames)
         backend = make_backend(args.monitor_backend, config=vcfg)
         probe = backend.probe()
         print(f"  monitor      : {policy_mode.value} via {backend.name} "
@@ -592,12 +595,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             # FIX 1: label by time AND viewpoint, and carry the previous tick
             # forward so there is a real temporal pair.
             cur = [(f"t base", u) for u in []]
+            # Order so that truncation to max_frames keeps a TEMPORAL pair
+            # (one camera at t-1 and t), not two viewpoints of one instant:
+            # [base t-1, base t, wrist t-1, wrist t]. Measured on the Jetson,
+            # each 640x480 frame costs ~310 prompt tokens for Qwen3-VL-2B, so
+            # the frame count sets the prefill cost and hence the latency.
+            prev_map = dict(prev_frames)
             labelled = []
-            for cam, url in sorted(zip(sorted(s.frames), 
-                                       obs.get("image_data_urls") or [])):
+            for cam, url in zip(sorted(s.frames), obs.get("image_data_urls") or []):
+                if cam in prev_map:
+                    labelled.append((f"t-1 {cam}", prev_map[cam]))
                 labelled.append((f"t {cam}", url))
-            if prev_frames:
-                labelled = [(f"t-1 {c}", u) for c, u in prev_frames] + labelled
             g = gate.step(
                 state=s.state, proposed_steps=int(d.get("steps") or 0) or 5,
                 frames=labelled,
@@ -704,8 +712,12 @@ def main(argv=None) -> int:
                     help="local | mock | unconfigured (a800/jetson are aliases "
                          "for local and are deprecated: the monitor runs on the "
                          "Jetson, the A800 cannot serve it)")
-    rn.add_argument("--monitor-timeout", type=float, default=6.0,
+    rn.add_argument("--monitor-timeout", type=float, default=12.0,
                     help="seconds; set from a MEASURED reading on this device")
+    rn.add_argument("--monitor-frames", type=int, default=2,
+                    help="images per observation (default 2 = one camera's "
+                         "t-1/t pair). Each frame is ~310 prompt tokens on "
+                         "Qwen3-VL-2B, so this sets prefill latency.")
     rn.add_argument("--monitor-url", help="OpenAI-compatible endpoint")
     rn.add_argument("--monitor-audit", help="append-only JSONL of monitor records")
     rn.add_argument("--monitor-shadow", action="store_true", default=True,
