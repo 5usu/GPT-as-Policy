@@ -435,7 +435,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     --astra-live is passed. Both are off by default so a first run costs nothing
     and touches nothing.
     """
-    from .pipeline import PolicyPipeline, resolve_mode
+    from .pipeline import PolicyPipeline, describe_trajectory, resolve_mode
     from .transports import AstraReviewSource, LocalPi05ProposalSource
     from .vlm_backends import VlmConfig, make_backend
     cfg = load_config(args.experiment)
@@ -478,8 +478,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                   "reachable. Start one (see vlm_backends.SERVER_EXAMPLES) or "
                   "run with --monitor-shadow.", file=sys.stderr)
             return 2
+        # FIX 3: shadow mode is worthless if the records are printed and
+        # dropped. One append-only JSONL row per evaluation.
+        mon_path = Path(args.monitor_audit or "monitor_shadow.jsonl")
+        mon_path.parent.mkdir(parents=True, exist_ok=True)
+        mon_f = mon_path.open("a")
+
+        def _persist(row):
+            mon_f.write(json.dumps(row, default=str) + "\n")
+            mon_f.flush()
+
         gate = PolicyPipeline(policy_mode, backend=backend,
-                              shadow=args.monitor_shadow)
+                              shadow=args.monitor_shadow, on_record=_persist)
+        print(f"  monitor log  : {mon_path} (append-only)")
         print(f"  monitor mode : {'SHADOW (records only)' if gate.shadow else 'GATING'}")
 
     review = AstraReviewSource(
@@ -516,6 +527,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         allowlist=[], supervisor=Supervisor(), ledger=CommandLedger(), secret=None)
     print()
     answered, tokens = 0, 0
+    prev_frames: list[tuple[str, str]] = []
     for s in samples:
         images = {cam: base64.b64encode(Path(f["frame_path"]).read_bytes()).decode()
                   for cam, f in sorted(s.frames.items())}
@@ -527,16 +539,33 @@ def cmd_run(args: argparse.Namespace) -> int:
         d = rec.decision or {}
         rv = rec.review or {}
         if gate is not None:
+            # FIX 2: the monitor must see pi0.5's ACTUAL proposal. `rec.proposal`
+            # is the model output; `s.recorded_chunk` is the human demonstration
+            # and was what the first version sent.
+            pi05_chunk = ((rec.proposal or {}).get("values")
+                          or (rec.proposal or {}).get("full_chunk")
+                          or [])
+            # FIX 1: label by time AND viewpoint, and carry the previous tick
+            # forward so there is a real temporal pair.
+            cur = [(f"t base", u) for u in []]
+            labelled = []
+            for cam, url in sorted(zip(sorted(s.frames), 
+                                       obs.get("image_data_urls") or [])):
+                labelled.append((f"t {cam}", url))
+            if prev_frames:
+                labelled = [(f"t-1 {c}", u) for c, u in prev_frames] + labelled
             g = gate.step(
                 state=s.state, proposed_steps=int(d.get("steps") or 0) or 5,
-                frames=list(obs.get("image_data_urls") or []),
+                frames=labelled,
                 state_text=f"joints_deg={[round(v, 2) for v in s.state[:6]]} "
                            f"gripper={s.state[6]:.3f}",
-                intent_text=f"next {len(s.recorded_chunk)} absolute joint targets",
+                intent_text=describe_trajectory(pi05_chunk, s.state),
                 episode_id=ep.m.episode_id, task=ep.m.instruction,
-                proposed_chunk=s.recorded_chunk, frames_meta=s.frames,
+                proposed_chunk=pi05_chunk, frames_meta=s.frames,
                 fk_preview=rec.fk_preview,
                 image_data_urls=list(obs.get("image_data_urls") or []))
+            prev_frames = [(c, u) for c, u in
+                           zip(sorted(s.frames), obs.get("image_data_urls") or [])]
             print(f"      monitor: {g.gate['disposition'] if g.gate else 'n/a'} "
                   f"steps={g.executed_steps} (baseline {g.baseline_steps})"
                   f"{' SHADOW' if g.shadow else ''}"
@@ -629,6 +658,7 @@ def main(argv=None) -> int:
     rn.add_argument("--monitor-backend", default="unconfigured",
                     help="mock | a800 | jetson | unconfigured")
     rn.add_argument("--monitor-url", help="OpenAI-compatible endpoint")
+    rn.add_argument("--monitor-audit", help="append-only JSONL of monitor records")
     rn.add_argument("--monitor-shadow", action="store_true", default=True,
                     help="record monitor decisions without gating (default)")
     rn.add_argument("--monitor-gate", dest="monitor_shadow",

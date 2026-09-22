@@ -386,14 +386,35 @@ class TestBackends:
         p = b.probe()
         assert p.available is False and "will not gate motion" in p.reason
 
-    def test_request_carries_multiple_frames_oldest_first(self):
+    def test_same_instant_viewpoints_are_not_called_a_time_sequence(self):
+        """The shadow-run defect: base+wrist from ONE tick were labelled
+        oldest/current and the model was asked what changed. There is no honest
+        answer, and SmolVLM2 correctly returned uncertain at zero confidence."""
         b = OpenAICompatibleBackend(VlmConfig())
-        body = b.build_body(frames=["data:a", "data:b"], state_text="s",
+        body = b.build_body(frames=["data:base", "data:wrist"], state_text="s",
                             intent_text="i")
         texts = [c["text"] for c in body["messages"][1]["content"]
                  if c["type"] == "text"]
-        assert any("oldest" in t for t in texts)
-        assert any("current" in t for t in texts)
+        assert not any("oldest" in t for t in texts)
+        assert any("same instant" in t for t in texts)
+        assert any("not a time sequence" in t for t in texts)
+
+    def test_labelled_pairs_carry_time_and_viewpoint(self):
+        b = OpenAICompatibleBackend(VlmConfig(max_frames=4))
+        body = b.build_body(
+            frames=[("t-1 base", "a"), ("t-1 wrist", "b"),
+                    ("t base", "c"), ("t wrist", "d")],
+            state_text="s", intent_text="i")
+        texts = [c["text"] for c in body["messages"][1]["content"]
+                 if c["type"] == "text"]
+        for tag in ("[t-1 base]", "[t-1 wrist]", "[t base]", "[t wrist]"):
+            assert tag in texts
+        assert not any("same instant" in t for t in texts)
+
+    def test_prompt_tells_the_model_how_to_read_the_labels(self):
+        from .vlm_backends import MONITOR_SYSTEM_PROMPT
+        assert "same instant are different viewpoints" in MONITOR_SYSTEM_PROMPT
+        assert "time labels differ" in MONITOR_SYSTEM_PROMPT
 
     def test_request_pins_the_strict_schema(self):
         b = OpenAICompatibleBackend(VlmConfig())
@@ -709,3 +730,66 @@ class TestAstraAnswerGoverns:
             out = p.step(state=STATE, proposed_steps=10, now=t + i,
                          proposed_chunk=[[0.0] * 7] * 50)
         assert out.executed_steps == out.baseline_steps == 5
+
+
+class TestShadowRunDefectsAreClosed:
+    """The three wiring defects a SmolVLM2-500M shadow run exposed.
+
+    Every evaluated tick came back uncertain/uncertain/unknown at confidence
+    0.0. That was the model answering correctly: it was shown two camera
+    viewpoints labelled as two moments, told the intent was "next 50 absolute
+    joint targets" with no values, and handed the human demonstration instead
+    of pi0.5's proposal. None of the three was evidence about the model.
+    """
+
+    def test_trajectory_is_rendered_not_counted(self):
+        from .pipeline import describe_trajectory
+        chunk = [[float(i)] * 7 for i in range(50)]
+        text = describe_trajectory(chunk, [0.0] * 7)
+        assert "t+00:" in text, "actual target values must be visible"
+        assert "net displacement" in text
+        assert text.strip() != "next 50 absolute joint targets"
+
+    def test_gripper_transition_is_called_out(self):
+        from .pipeline import describe_trajectory
+        chunk = [[0.0] * 6 + [0.0]] * 25 + [[0.0] * 6 + [1.0]] * 25
+        assert "closing" in describe_trajectory(chunk, [0.0] * 7)
+
+    def test_missing_trajectory_says_so_rather_than_implying_one(self):
+        from .pipeline import describe_trajectory
+        text = describe_trajectory(None)
+        assert "NO PROPOSED TRAJECTORY" in text and "uncertain" in text
+
+    def test_preview_is_bounded_for_a_small_context(self):
+        from .pipeline import INTENT_PREVIEW_STEPS, describe_trajectory
+        chunk = [[float(i)] * 7 for i in range(50)]
+        shown = describe_trajectory(chunk, [0.0] * 7).count("  t+")
+        assert shown == INTENT_PREVIEW_STEPS <= 10
+
+    def test_records_are_persisted_not_just_printed(self, tmp_path):
+        """Shadow mode with no saved records cannot be evaluated afterwards."""
+        rows = []
+        p = PolicyPipeline("pi05_local_monitor",
+                           backend=MockMonitorBackend([reading()] * 3),
+                           policy=MonitorPolicy(max_reading_age_s=60.0),
+                           on_record=rows.append, shadow=True)
+        t = time.time()
+        for i in range(3):
+            p.step(state=STATE, proposed_steps=5, now=t + i)
+        assert len(rows) == 3
+        for r in rows:
+            for k in ("gate", "monitor_latency_s", "proposed_steps",
+                      "executed_steps", "baseline_steps", "monitor_error"):
+                assert k in r, k
+
+    def test_persisted_record_carries_the_clamp_and_the_reason(self, tmp_path):
+        rows = []
+        p = PolicyPipeline("pi05_local_monitor",
+                           backend=MockMonitorBackend(
+                               [reading(execute_steps=99)]),
+                           policy=MonitorPolicy(max_reading_age_s=60.0),
+                           on_record=rows.append, shadow=False)
+        p.step(state=STATE, proposed_steps=50)
+        g = rows[0]["gate"]
+        assert g["clamped_from"] == 99
+        assert g["execute_steps"] < 99 and g["reason"]

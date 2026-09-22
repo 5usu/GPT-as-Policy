@@ -58,11 +58,15 @@ SERVER_EXAMPLES = {
 MONITOR_SYSTEM_PROMPT = """You are a safety MONITOR for a robot arm. You are not \
 a controller and you do not command motion.
 
-You see recent observation frames (oldest first) and deterministic robot state, \
-plus the trajectory the policy intends to execute next. Report what you OBSERVE.
+You see observation frames, deterministic robot state, and the trajectory the \
+policy intends to execute next. Report what you OBSERVE.
 
-Judge CHANGE between the frames, not a single still. If you cannot see the \
-target, say so rather than guessing.
+Each frame is labelled with its TIME and its CAMERA. Frames from the same \
+instant are different viewpoints, not a sequence: judge change over time only \
+between frames whose time labels differ. If you are given only one instant, \
+report progress from the state and the proposal, and say uncertain about change.
+
+If you cannot see the target, say so rather than guessing.
 
 Return only the JSON object described by the schema. `execute_steps` is a \
 REQUEST, not a command: it is clamped independently and a larger number does not \
@@ -208,14 +212,38 @@ class OpenAICompatibleBackend:
                             self.config.endpoint,
                             round(time.monotonic() - t0, 4))
 
-    def build_body(self, *, frames: Sequence[str], state_text: str,
+    def build_body(self, *, frames: Sequence[Any], state_text: str,
                    intent_text: str) -> dict[str, Any]:
+        """Frames may be bare URLs or (label, url) pairs.
+
+        A LABEL IS NOT COSMETIC. The first version numbered frames by position
+        and called index 0 "oldest" -- so when the caller passed base and wrist
+        from the SAME tick, the model was told two viewpoints were two moments
+        and asked what changed between them. There is no honest answer to that,
+        and the model correctly returned uncertain with zero confidence.
+        Labels now carry time AND viewpoint, and a caller that supplies only
+        viewpoints gets no temporal claim made on its behalf.
+        """
         content: list[dict[str, Any]] = []
-        for i, url in enumerate(list(frames)[: self.config.max_frames]):
-            label = "oldest" if i == 0 else (
-                "current" if i == len(frames) - 1 else f"t-{len(frames)-1-i}")
-            content.append({"type": "text", "text": f"[frame {i}: {label}]"})
+        items = list(frames)[: self.config.max_frames]
+        labelled = [it if isinstance(it, (tuple, list)) and len(it) == 2
+                    else (None, it) for it in items]
+        has_time = any(lbl for lbl, _ in labelled)
+        for i, (label, url) in enumerate(labelled):
+            if label:
+                tag = f"[{label}]"
+            elif has_time:
+                tag = f"[frame {i}: unlabelled]"
+            else:
+                # No temporal information was supplied. Say so rather than
+                # inventing an ordering the caller did not claim.
+                tag = f"[view {i} of {len(labelled)}, same instant]"
+            content.append({"type": "text", "text": tag})
             content.append({"type": "image_url", "image_url": {"url": url}})
+        if not has_time and len(labelled) > 1:
+            content.append({"type": "text", "text": (
+                "NOTE: these are different CAMERA VIEWPOINTS at one instant, not "
+                "a time sequence. Do not report change over time from them.")})
         content.append({"type": "text",
                         "text": f"ROBOT STATE (deterministic):\n{state_text}"})
         content.append({"type": "text",

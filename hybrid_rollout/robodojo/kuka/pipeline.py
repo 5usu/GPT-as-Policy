@@ -44,6 +44,48 @@ from .vlm_monitor import (Disposition, GateDecision, MonitorGate, MonitorPolicy,
 
 SCHEMA = "hybrid_rollout.robodojo.kuka.pipeline.v1"
 
+#: How many leading targets to show the monitor verbatim. A 500M model's
+#: context is small and 50x7 floats would swamp the images; the leading rows
+#: plus per-joint net displacement carry the signal that matters for "is this
+#: heading where it should".
+INTENT_PREVIEW_STEPS = 5
+
+
+def describe_trajectory(chunk: Sequence[Sequence[float]] | None,
+                        state: Sequence[float] | None = None,
+                        *, preview: int = INTENT_PREVIEW_STEPS) -> str:
+    """Render the ACTUAL proposed targets for the monitor.
+
+    The first version sent only a phrase -- "next 50 absolute joint targets" --
+    the COUNT and not the values, then asked whether the intent was aligned.
+    There was nothing to align against, so uncertain was the only honest answer.
+    """
+    if not chunk:
+        return ("NO PROPOSED TRAJECTORY SUPPLIED. Report intent as uncertain; "
+                "do not infer one.")
+    rows = [list(r) for r in chunk]
+    n = len(rows)
+    lines = [f"{n} absolute joint targets in degrees at 30 Hz "
+             f"({n / 30.0:.2f} s), A1-A6 then gripper.",
+             f"first {min(preview, n)} shown verbatim:"]
+    for i, r in enumerate(rows[:preview]):
+        lines.append(f"  t+{i:02d}: {[round(float(v), 2) for v in r[:ARM_DIM]]} "
+                     f"grip={float(r[ARM_DIM]):.2f}" if len(r) > ARM_DIM
+                     else f"  t+{i:02d}: {[round(float(v), 2) for v in r[:ARM_DIM]]}")
+    if state is not None and len(state) >= ARM_DIM:
+        net = [round(float(rows[-1][j]) - float(state[j]), 2)
+               for j in range(ARM_DIM)]
+        lines.append(f"net displacement from the current pose over the whole "
+                     f"chunk: {net} deg")
+    if len(rows[0]) > ARM_DIM:
+        g0, g1 = float(rows[0][ARM_DIM]), float(rows[-1][ARM_DIM])
+        if abs(g1 - g0) > 0.05:
+            lines.append(f"gripper transitions {g0:.2f} -> {g1:.2f} "
+                         f"({'closing' if g1 > g0 else 'opening'})")
+        else:
+            lines.append(f"gripper held near {g0:.2f}")
+    return "\n".join(lines)
+
 
 class PolicyMode(str, Enum):
     PI05_ONLY = "pi05_only"
