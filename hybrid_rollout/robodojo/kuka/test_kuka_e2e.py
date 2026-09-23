@@ -37,19 +37,22 @@ class FakeTransport:
     """A controller that sends Rob frames and records the Sen replies."""
 
     def __init__(self, joints=None, *, drop_every=0, freeze_ipoc=False,
-                 track=True):
+                 track=True, malformed=False):
         self.joints = list(joints or START)
         self.ipoc = 0
         self.sent: list[str] = []
         self.drop_every = drop_every
         self.freeze_ipoc = freeze_ipoc
         self.track = track
+        self.malformed = malformed
         self.n = 0
 
     def receive(self, timeout_s):
         self.n += 1
         if self.drop_every and self.n % self.drop_every == 0:
             return None                       # dropped packet
+        if self.malformed:
+            return b"<Rob Type=\"KUKA\"><garbage/></Rob>", ("127.0.0.1", 59152)
         if not self.freeze_ipoc:
             self.ipoc += 1
         ak = " ".join(f'A{i+1}="{v:.4f}"' for i, v in enumerate(self.joints))
@@ -179,17 +182,43 @@ class TestFailureScenarios:
             LiveCameras(mapping={"base": 0, "wrist": 1}).start()
         assert "metadata" in str(e.value)
 
-    def test_3_stale_ipoc_is_not_answered_and_holds(self):
+    def test_3_stale_ipoc_is_answered_but_never_commanded(self):
+        """Reversed deliberately.
+
+        The old contract refused to answer a stale IPOC. That is not a safe
+        default: RSI requires a reply every cycle, so staying silent turns a
+        reordered or duplicated packet into a controller fault -- the exact
+        failure the reply was withheld to avoid. The real invariant is narrower:
+        a stale frame must not CONSUME A COMMAND. The reply echoes that frame's
+        own IPOC, so it cannot be applied to a different cycle.
+        """
         t = FakeTransport(freeze_ipoc=True)
         c = controller(t)
         arm(c)
         c.submit([v + 1.0 for v in START], observation_epoch=time.time())
         answered_before = len(t.sent)
+        queued_before = len(c._queue)
         for _ in range(5):
             c.serve_cycle()
         assert c.adapter.ipoc_regressions > 0
-        assert len(t.sent) == answered_before, "a stale IPOC must not be answered"
-        assert c.state is State.HOLD
+        assert len(t.sent) > answered_before, \
+            "every parseable frame must be answered; silence faults the controller"
+        assert len(c._queue) == queued_before, \
+            "a stale frame must not advance the commanded trajectory"
+        for frame in t.sent[answered_before:]:
+            assert "<Stopflag>1</Stopflag>" in frame, \
+                "a held reply must carry the stop flag"
+
+    def test_3b_a_malformed_frame_still_cannot_be_answered(self):
+        """The one case where silence is unavoidable: no IPOC to echo."""
+        t = FakeTransport(malformed=True)
+        c = controller(t)
+        answered_before = len(t.sent)
+        for _ in range(3):
+            c.serve_cycle()
+        assert c.adapter.malformed > 0
+        assert len(t.sent) == answered_before, \
+            "an unparseable frame has no IPOC, so guessing one is worse"
 
     def test_4_dropped_packet_holds_without_faulting(self):
         t = FakeTransport(drop_every=2)
