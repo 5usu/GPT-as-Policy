@@ -240,17 +240,58 @@ class TestLiveSourcesAreOffByDefault:
         with pytest.raises(ValueError):
             LocalPi05ProposalSource()
 
-    def test_no_serving_layer_remains(self):
-        """The operator runs the model; this package must not prescribe serving."""
-        import importlib
-        with pytest.raises(ModuleNotFoundError):
-            importlib.import_module("hybrid_rollout.robodojo.kuka.pi05_serve")
+    def test_the_package_still_refuses_to_load_a_policy(self):
+        """Narrowed deliberately, and the reason matters.
+
+        The old rule was that no pi05_serve module may exist at all. That rule
+        left jetson/pi05_serve_jetson.py importing a module that was not
+        committed, so the one launcher able to serve this checkpoint has been
+        failing with ImportError -- which is why "live pi0.5" has meant
+        replaying precomputed chunks.
+
+        The principle worth keeping is narrower than the old rule: this package
+        must not decide HOW the checkpoint is loaded or run. pi05_serve supplies
+        the HTTP surface the committed launcher expects and nothing else; its
+        load_policy refuses, and the deployment engineer's loader is injected
+        over the top.
+        """
+        from . import pi05_serve
+        with pytest.raises(NotImplementedError) as e:
+            pi05_serve.load_policy("/some/checkpoint")
+        assert "no loader installed" in str(e.value)
+        assert pi05_serve.predict({"state": []})["ok"] is False
+
+    def test_the_serving_layer_enforces_the_checkpoint_contract(self):
+        """The eight look-alike finetunes load cleanly and return the wrong
+        space. That must be refused at load, not discovered on the arm."""
+        from .pi05_serve import ContractViolation, check_contract
+        check_contract({"use_relative_actions": True})
+        with pytest.raises(ContractViolation) as e:
+            check_contract({"use_relative_actions": False,
+                            "checkpoint": "/models/looks_right"})
+        assert "WRONG SPACE" in str(e.value)
+
+    def test_the_serving_layer_refuses_a_malformed_chunk(self):
+        from .pi05_serve import validate_rows
+        good = {"ok": True, "rows": [[0.0] * 7 for _ in range(50)]}
+        assert validate_rows(good) is good
+        assert "expected 50 steps" in validate_rows(
+            {"ok": True, "rows": [[0.0] * 7]})["error"]
+        assert "values, expected 7" in validate_rows(
+            {"ok": True, "rows": [[0.0] * 6 for _ in range(50)]})["error"]
+        bad = [[0.0] * 7 for _ in range(50)]
+        bad[3][2] = float("inf")
+        assert "row 3" in validate_rows({"ok": True, "rows": bad})["error"]
 
 class TestStreamingSurvivesALongReview:
-    """PROPERTY: a review that takes longer than the proxy's idle timeout still
-    completes. Measured on the Jetson: a non-streaming call is cut at ~108 s by
-    the outbound proxy while gpt-6-astra needs ~130 s, so the answer never
-    arrives; a streamed call keeps bytes flowing and returns."""
+    """PROPERTY: a long review still completes.
+
+    SUPERSEDED IN THE FIELD -- kept because the SSE parsing it covers is still
+    used, but streaming is no longer the answer to the proxy. Later measurement
+    on the Jetson put the cutoff at ~62 s, not ~108 s, and found a streamed
+    review hanging INDEFINITELY rather than returning: urllib's timeout is per
+    socket read, so keep-alives reset it forever. Background submit/poll
+    replaces this; see TestAstraBackgroundMode in test_kuka_gates.py."""
 
     def sse(self, response):
         import json as _json

@@ -50,6 +50,12 @@ def controller(tr, *, allow_motion=False):
     return ExecutionController(ProtocolAdapter(tr), allow_motion=allow_motion)
 
 
+def FRAMES():
+    """A camera that returns one frame, keyed by name as pi0.5 needs it."""
+    url = "data:image/jpeg;base64,AAAA"
+    return [url], {"base": {"live": True}}, {"base": url}
+
+
 def run_for(run, n):
     for _ in range(n):
         run.serve_one()
@@ -181,7 +187,8 @@ class TestProposalParsing:
         pipe = StubPipeline()
         run = LiveObservationRun(controller(tr),
                                  pi05_infer=lambda o: {"ok": False, "error": "x"},
-                                 pipeline=pipe, min_model_interval_s=0.0)
+                                 pipeline=pipe, min_model_interval_s=0.0,
+                                 grab_frames=FRAMES)
         run.shared.publish(START, 1, time.time())
         t = run.start_models()
         for _ in range(200):                   # wait for at least one cycle
@@ -205,3 +212,52 @@ class TestAssertCannotMove:
     def test_guard_rejects_anything_that_claims_it_may_move(self):
         with pytest.raises(MotionAttempted):
             assert_cannot_move(type("X", (), {"allow_motion": True})())
+
+
+class TestBlindInferenceIsRefused:
+    """pi0.5 maps frames to observation.images.<name>; a flat list is not
+    enough, and no frames at all is not an observation."""
+
+    def _run(self, grab):
+        tr = FakeTransport()
+        pipe = StubPipeline()
+        run = LiveObservationRun(controller(tr), pi05_infer=lambda o: CHUNK,
+                                 pipeline=pipe, min_model_interval_s=0.0,
+                                 grab_frames=grab)
+        run.shared.publish(START, 1, time.time())
+        t = run.start_models()
+        for _ in range(200):
+            if run.cycles:
+                break
+            time.sleep(0.005)
+        run.stop()
+        t.join(timeout=2.0)
+        return run, pipe
+
+    def test_no_frames_is_refused_rather_than_inferred_from_state(self):
+        run, pipe = self._run(lambda: ([], {}, {}))
+        assert run.cycles and "infer blind" in (run.cycles[0].error or "")
+        assert run.cycles[0].would_have_commanded is None
+        assert pipe.calls == 0
+
+    def test_named_frames_reach_the_model_keyed_by_camera(self):
+        seen = {}
+
+        def capture(obs):
+            seen.update(obs.get("images") or {})
+            return CHUNK
+
+        tr = FakeTransport()
+        run = LiveObservationRun(controller(tr), pi05_infer=capture,
+                                 pipeline=StubPipeline(),
+                                 min_model_interval_s=0.0, grab_frames=FRAMES)
+        run.shared.publish(START, 1, time.time())
+        t = run.start_models()
+        for _ in range(200):
+            if run.cycles:
+                break
+            time.sleep(0.005)
+        run.stop()
+        t.join(timeout=2.0)
+        assert "base" in seen, "pi0.5 must receive frames keyed by camera name"
+        assert seen["base"].startswith("data:image/jpeg")

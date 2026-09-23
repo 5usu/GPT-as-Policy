@@ -269,7 +269,10 @@ def cmd_live(args: argparse.Namespace) -> int:
     """
     import socket as _s
     from . import cell as C
-    from .cameras import LiveCameras, frames_to_data_urls, frames_to_packet_refs
+    import base64 as _b64
+
+    from .cameras import (ENCODE_MIME, LiveCameras, frames_to_data_urls,
+                          frames_to_packet_refs)
     from .execution import ExecutionController, ProtocolAdapter
     from .live import LiveObservationRun, RSI_HEALTHY_HZ
     from .pipeline import PolicyPipeline, resolve_mode
@@ -292,13 +295,39 @@ def cmd_live(args: argparse.Namespace) -> int:
         pi05_desc = f"REPLAY from {args.chunks_file} (NOT live inference)"
     elif args.pi05_url:
         import urllib.request as _u
+        # A loopback model server must not be routed through the outbound
+        # proxy: urllib does NOT bypass 127.0.0.1 unless no_proxy says so, and
+        # sending frames through Clash to reach this machine would add the very
+        # latency this measurement is trying to characterise.
+        _direct = _u.build_opener(_u.ProxyHandler({}))
+        _seen_contract = {"checked": False}
+
         def pi05_infer(obs):
-            body = json.dumps({"images": {}, "state": obs["joints_deg"],
-                               "observation_id": obs["observation_id"]}).encode()
+            body = json.dumps({
+                "state": obs["joints_deg"],
+                "images": obs.get("images") or {},
+                "task": obs.get("task", ""),
+                "observation_id": obs["observation_id"]}).encode()
             req = _u.Request(args.pi05_url, data=body, method="POST",
                              headers={"Content-Type": "application/json"})
-            with _u.urlopen(req, timeout=args.pi05_timeout) as r:
-                return json.loads(r.read().decode())
+            with _direct.open(req, timeout=args.pi05_timeout) as r:
+                out = json.loads(r.read().decode())
+            # Enforce the checkpoint contract on the RESPONSE. The eight
+            # look-alike finetunes report use_relative_actions=False and return
+            # targets in the wrong space without erroring, so trusting the
+            # endpoint's name is not enough.
+            meta = (out or {}).get("meta") or {}
+            rel = meta.get("use_relative_actions")
+            if rel is not True:
+                return {"ok": False,
+                        "error": f"pi0.5 server reports use_relative_actions="
+                                 f"{rel!r}, expected True; refusing the chunk "
+                                 f"(checkpoint={meta.get('checkpoint')!r})"}
+            if not _seen_contract["checked"]:
+                _seen_contract["checked"] = True
+                print(f"  pi0.5 contract OK: use_relative_actions=True, "
+                      f"checkpoint={meta.get('checkpoint')}")
+            return out
         pi05_desc = f"LIVE via {args.pi05_url}"
     else:
         print("REFUSED: no pi0.5 source. Pass --pi05-url (a running server) or\n"
@@ -319,9 +348,13 @@ def cmd_live(args: argparse.Namespace) -> int:
 
     def grab():
         if cams is None:
-            return [], {}
+            return [], {}, {}
         frames = cams.capture()
-        return frames_to_data_urls(frames), frames_to_packet_refs(frames)
+        named = {name: f"data:{ENCODE_MIME};base64," +
+                       _b64.b64encode(fr.png).decode()
+                 for name, fr in sorted(frames.items()) if fr.png}
+        return (frames_to_data_urls(frames), frames_to_packet_refs(frames),
+                named)
 
     # ---- monitor + astra --------------------------------------------------
     cfg = VlmConfig.jetson(timeout_s=args.monitor_timeout)

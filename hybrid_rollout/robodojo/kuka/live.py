@@ -79,6 +79,10 @@ class SharedState:
                     self.ipoc, self.updated_at)
 
 
+class _Blind(RuntimeError):
+    """No frames this cycle. Refused rather than inferred from state alone."""
+
+
 class MotionAttempted(RuntimeError):
     """Raised if anything tries to command motion from this mode."""
 
@@ -128,7 +132,7 @@ class LiveObservationRun:
     def __init__(self, controller: Any, *,
                  pi05_infer: Callable[[dict[str, Any]], Any],
                  pipeline: Any,
-                 grab_frames: Callable[[], tuple[list[str], dict[str, Any]]] | None = None,
+                 grab_frames: Callable[[], tuple[list[str], dict[str, Any], dict[str, str]]] | None = None,
                  audit_path: str | None = None,
                  min_model_interval_s: float = 1.0,
                  task: str = "",
@@ -192,10 +196,18 @@ class LiveObservationRun:
                 }
                 urls: list[str] = []
                 meta: dict[str, Any] = {}
+                named: dict[str, str] = {}
                 if self.grab_frames is not None:
-                    urls, meta = self.grab_frames()
+                    urls, meta, named = self.grab_frames()
                     observation["image_data_urls"] = urls
                     observation["frames_meta"] = meta
+                    # pi0.5 needs the frames KEYED BY CAMERA, not a flat list:
+                    # the checkpoint maps them to observation.images.<name>.
+                    observation["images"] = named
+                if not named:
+                    rec.error = ("no camera frames; pi0.5 would infer blind and "
+                                 "the monitor would judge a scene it cannot see")
+                    raise _Blind(rec.error)
 
                 t0 = time.time()
                 proposal = self.pi05_infer(observation)
@@ -225,6 +237,8 @@ class LiveObservationRun:
                     # command. Recorded so the gap is inspectable, never sent.
                     rec.would_have_commanded = [round(float(v), 4)
                                                 for v in rows[0][:ARM_DIM]]
+            except _Blind:
+                pass                       # rec.error already set, and precise
             except Exception as exc:                            # noqa: BLE001
                 rec.error = f"{type(exc).__name__}: {exc}"[:300]
             finally:
