@@ -201,11 +201,24 @@ class LocalPi05ProposalSource:
     def __init__(self, infer=None, *, chunks: dict[str, list[list[float]]] | None = None,
                  checkpoint_id: str | None = None,
                  meta: dict[str, Any] | None = None,
-                 expected_steps: int = 50, expected_dims: int = 7) -> None:
+                 expected_steps: int = 50, expected_dims: int = 7,
+                 sequential: bool = False) -> None:
         if infer is None and chunks is None:
             raise ValueError("supply either infer= (a callable) or chunks= (precomputed)")
         self.infer = infer
         self.chunks = dict(chunks or {})
+        # SEQUENTIAL REPLAY -- for `cli live`, where ids cannot match.
+        # live.py names each observation `live:{ipoc}` from the controller's
+        # counter, while a recorded file is keyed `<episode>:t000050`. Keyed
+        # lookup therefore misses every time (measured: 150/150 cycles failed
+        # with "no proposal for live:86302460"). Replay serves the recorded
+        # chunks IN ORDER instead, cycling, and names the one it served so the
+        # audit cannot imply the trajectory came from the live scene.
+        # Off by default: `cli run` has matching ids, and there a missing chunk
+        # is a real error worth reporting rather than papering over.
+        self.sequential = bool(sequential)
+        self._order = [k for k in self.chunks if not str(k).startswith("_")]
+        self._next = 0
         self.checkpoint_id = checkpoint_id
         self.meta = dict(meta or {})
         self.expected_steps = expected_steps
@@ -234,7 +247,15 @@ class LocalPi05ProposalSource:
             return {"ok": False, "error": bad}
         oid = observation.get("observation_id")
         try:
-            rows = (self.chunks.get(oid) if self.infer is None
+            if self.infer is None and self.sequential:
+                if not self._order:
+                    return {"ok": False, "error": "no chunks to replay"}
+                key = self._order[self._next % len(self._order)]
+                self._next += 1
+                rows, replayed_from = self.chunks.get(key), key
+            else:
+                replayed_from = None
+                rows = (self.chunks.get(oid) if self.infer is None
                     else self.infer(observation))
         except Exception as exc:                               # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
@@ -247,6 +268,11 @@ class LocalPi05ProposalSource:
         if any(len(r) != self.expected_dims for r in rows):
             return {"ok": False,
                     "error": f"every row must have {self.expected_dims} values"}
+        if replayed_from is not None:
+            return {"ok": True, "rows": rows, "checkpoint_id": self.checkpoint_id,
+                    "replayed_from": replayed_from, "is_live": False,
+                    "provenance": "recorded_chunk_replay",
+                    "source": self.name, "meta": self.meta}
         return {"ok": True, "rows": rows, "checkpoint_id": self.checkpoint_id,
                 "source": self.name, "is_live": True,
                 "provenance": self.provenance, "meta": self.meta}

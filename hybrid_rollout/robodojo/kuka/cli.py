@@ -287,7 +287,7 @@ def cmd_live(args: argparse.Namespace) -> int:
     # ---- pi0.5 proposal source ------------------------------------------
     if args.chunks_file:
         from .transports import LocalPi05ProposalSource
-        src = LocalPi05ProposalSource.from_file(args.chunks_file)
+        src = LocalPi05ProposalSource.from_file(args.chunks_file, sequential=True)
         def pi05_infer(obs):
             return src.propose(obs)
         pi05_desc = f"REPLAY from {args.chunks_file} (NOT live inference)"
@@ -321,7 +321,7 @@ def cmd_live(args: argparse.Namespace) -> int:
     def grab():
         if cams is None:
             return [], {}
-        frames = cams.capture()
+        frames = cams.snapshot()
         return frames_to_data_urls(frames), frames_to_packet_refs(frames)
 
     # ---- monitor + astra --------------------------------------------------
@@ -985,7 +985,9 @@ def main(argv=None) -> int:
     lv.add_argument("--policy-mode", default="pi05_local_monitor_astra")
     lv.add_argument("--monitor-backend", default="local")
     lv.add_argument("--monitor-url")
-    lv.add_argument("--monitor-timeout", type=float, default=6.0)
+    lv.add_argument("--monitor-timeout", type=float, default=12.0,
+                    help="seconds; MEASURED on this device (5.1-9.1 s over "
+                         "13 readings at MODE_30W). 6 s failed 8 of 8.")
     lv.add_argument("--astra-url", default="https://api.openai.com/v1/responses")
     lv.add_argument("--astra-model", default="gpt-6-astra")
     lv.add_argument("--astra-key-env", default="OPENAI_API_KEY")
