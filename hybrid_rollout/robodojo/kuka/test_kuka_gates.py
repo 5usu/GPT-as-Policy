@@ -362,3 +362,58 @@ class TestAstraBackgroundMode:
         body = s.build_body({"system": "s", "user_text": "u",
                              "response_schema": {}})
         assert "background" not in body and body["store"] is False
+
+
+class TestArmingIdentityAndSigningKey:
+    """Both were hardcoded empty. An empty allowlist refuses everything, which
+    is the right default -- but it must read as a decision, not a bug."""
+
+    GOOD = {"robot_model": "LBR iisy 11 R1300", "controller_serial": "S-1",
+            "rsi_host": "172.17.255.2", "rsi_port": 59152}
+
+    def test_identity_names_every_missing_field(self):
+        from .safety import ArmingRefused, identity_from_config
+        with pytest.raises(ArmingRefused) as e:
+            identity_from_config({"robot_model": "x"})
+        assert e.value.code == "identity_incomplete"
+        for f in ("controller_serial", "rsi_host", "rsi_port"):
+            assert f in str(e.value)
+
+    def test_identity_is_an_exact_four_field_match(self):
+        from .safety import RobotIdentity, check_allowlist, identity_from_config
+        me = identity_from_config(dict(self.GOOD))
+        check_allowlist(me, [me])
+        other = RobotIdentity("LBR iisy 11 R1300", "S-2",
+                              "172.17.255.2", 59152)
+        with pytest.raises(Exception):
+            check_allowlist(other, [me])
+
+    def test_a_missing_signing_key_is_refused_by_name(self):
+        import os
+        from .safety import ArmingRefused, signing_key_from_env
+        os.environ.pop("NO_SUCH_KEY", None)
+        with pytest.raises(ArmingRefused) as e:
+            signing_key_from_env("NO_SUCH_KEY")
+        assert e.value.code == "no_signing_key"
+        assert "$NO_SUCH_KEY" in str(e.value)
+
+    def test_a_short_key_is_refused(self):
+        import os
+        from .safety import ArmingRefused, signing_key_from_env
+        os.environ["SHORT_SIGNING_KEY"] = "abc"
+        with pytest.raises(ArmingRefused) as e:
+            signing_key_from_env("SHORT_SIGNING_KEY")
+        assert e.value.code == "weak_signing_key"
+
+    def test_the_key_value_never_appears_in_any_message(self):
+        """The credential is read by name and must not leak into an error."""
+        import os
+        from .safety import ArmingRefused, signing_key_from_env
+        secret = "s3cr3t-" + "z" * 30
+        os.environ["LEAK_TEST_KEY"] = secret
+        key = signing_key_from_env("LEAK_TEST_KEY")
+        assert key == secret.encode()
+        os.environ["LEAK_TEST_KEY"] = "short"
+        with pytest.raises(ArmingRefused) as e:
+            signing_key_from_env("LEAK_TEST_KEY")
+        assert "short" not in str(e.value).replace("is 5 bytes", "")

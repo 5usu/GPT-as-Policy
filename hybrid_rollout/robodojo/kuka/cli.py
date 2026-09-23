@@ -632,6 +632,34 @@ def cmd_phase1(args: argparse.Namespace) -> int:
     return 0
 
 
+def _arming_identity(args, cfg: dict) -> tuple[list, object | None, list[str]]:
+    """Build (allowlist, signing key, blockers) for a loop that may arm.
+
+    Both were hardcoded to [] and None, which refuses everything -- correct as
+    a default, but indistinguishable from a configuration bug. This makes the
+    refusal explicit and tells the operator what to supply. The key is read
+    from the environment BY NAME and never printed or stored.
+    """
+    from .safety import (ArmingRefused, identity_from_config,
+                         signing_key_from_env)
+    allowlist, secret, blockers = [], None, []
+    src = dict(cfg or {})
+    for f in ("robot_model", "controller_serial", "rsi_host", "rsi_port"):
+        v = getattr(args, f, None)
+        if v:
+            src[f] = v
+    try:
+        allowlist = [identity_from_config(src)]
+    except ArmingRefused as exc:
+        blockers.append(str(exc))
+    try:
+        secret = signing_key_from_env(getattr(args, "signing_key_env", "") or
+                                      "KUKA_SIGNING_KEY")
+    except ArmingRefused as exc:
+        blockers.append(str(exc))
+    return allowlist, secret, blockers
+
+
 def cmd_phase2(args: argparse.Namespace) -> int:
     """Replay the recorded trajectory under full gating while Astra watches."""
     cfg = load_config(args.experiment)
@@ -656,12 +684,20 @@ def cmd_phase2(args: argparse.Namespace) -> int:
         return 2
     gw = ShadowGateway()
     audit = AuditLog(args.audit or "phase2_audit.jsonl")
+    _allow, _secret, _arm_blockers = _arming_identity(args, flat)
+    if _arm_blockers:
+        print("  arming       : REFUSED")
+        for b in _arm_blockers:
+            print(f"                 - {b}")
+    else:
+        print(f"  arming       : identity {_allow[0].key()}, signing key present")
     loop = KukaReviewLoop(
         mode=Mode.REVIEWED_EXECUTION, config=flat, raw_config=cfg,
         proposal_source=src, review_source=None, gateway=gw,
         fk=make_fk(), audit=audit,
         target=RobotIdentity(ROBOT_MODEL, args.serial or "UNSET", "172.17.255.2", 59152),
-        allowlist=[], supervisor=Supervisor(), ledger=CommandLedger(), secret=None)
+        allowlist=_allow, supervisor=Supervisor(), ledger=CommandLedger(),
+        secret=_secret)
     print()
     for s in samples:
         rec = loop.step({"observation_id": s.observation_id, "state": s.state,
@@ -820,7 +856,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         fk=fk, audit=audit,
         target=RobotIdentity(ROBOT_MODEL, args.serial or "UNSET",
                              "172.17.255.2", 59152),
-        allowlist=[], supervisor=Supervisor(), ledger=CommandLedger(), secret=None)
+        # cmd_run is shadow-only (ShadowGateway has no socket), so an empty
+        # allowlist and absent key are correct here and stay explicit.
+        allowlist=[], supervisor=Supervisor(), ledger=CommandLedger(),
+        secret=None)
     print()
     answered, tokens = 0, 0
     prev_frames: list[tuple[str, str]] = []

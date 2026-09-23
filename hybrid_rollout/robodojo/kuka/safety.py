@@ -110,6 +110,56 @@ class RobotIdentity:
         return f"{self.robot_model}|{self.controller_serial}|{self.rsi_host}:{self.rsi_port}"
 
 
+#: Identity fields the operator must state. They are not measurements and
+#: cannot be derived from the cell, so they are never defaulted.
+IDENTITY_FIELDS = ("robot_model", "controller_serial", "rsi_host", "rsi_port")
+
+
+def identity_from_config(cfg: dict) -> RobotIdentity:
+    """Build the one robot this build may address, from validated config.
+
+    Raises ArmingRefused naming every missing field. An empty allowlist is not
+    a permissive default -- it refuses everything -- but a silently-empty one
+    reads as a configuration bug rather than a decision, so this exists to make
+    populating it explicit.
+    """
+    missing = [f for f in IDENTITY_FIELDS if not cfg.get(f)]
+    if missing:
+        raise ArmingRefused(
+            "identity_incomplete",
+            "the robot this build may address is not fully stated; missing "
+            + ", ".join(missing) + ". These are operator facts, not "
+            "measurements, and are never defaulted.")
+    return RobotIdentity(
+        robot_model=str(cfg["robot_model"]),
+        controller_serial=str(cfg["controller_serial"]),
+        rsi_host=str(cfg["rsi_host"]),
+        rsi_port=int(cfg["rsi_port"]))
+
+
+def signing_key_from_env(var_name: str) -> bytes:
+    """Read the command-signing key from the environment BY NAME.
+
+    The key itself is never printed, logged, hashed into any message, or placed
+    in a returned structure -- only its presence and length are ever observed.
+    """
+    import os
+    raw = os.environ.get(var_name or "", "")
+    if not raw:
+        raise ArmingRefused(
+            "no_signing_key",
+            f"${var_name} is empty. Commands are signed so a replayed or "
+            f"forged envelope cannot reach the arm; without a key there is "
+            f"nothing to verify against. Set it in the operator's environment "
+            f"-- it is never read from a file or a flag.")
+    key = raw.encode() if isinstance(raw, str) else bytes(raw)
+    if len(key) < 16:
+        raise ArmingRefused(
+            "weak_signing_key",
+            f"${var_name} is {len(key)} bytes; at least 16 are required.")
+    return key
+
+
 def check_allowlist(target: RobotIdentity,
                     allowlist: Iterable[RobotIdentity]) -> None:
     """Exact match on all four fields. No wildcards, no prefix matching."""
