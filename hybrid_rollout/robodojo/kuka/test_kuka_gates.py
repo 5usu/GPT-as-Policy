@@ -260,3 +260,105 @@ class TestMatchesDeployedRobotStack:
         from .contract import DATASET_ROBOT_TYPE, MODEL_IDENTIFICATION_BASIS
         assert DATASET_ROBOT_TYPE == "kuka_lbr_iico"
         assert "never names the model" in MODEL_IDENTIFICATION_BASIS
+
+
+class TestAstraBackgroundMode:
+    """The proxy cuts a held connection at ~60 s; a review needs ~130 s."""
+
+    def _src(self, submit, gets, **kw):
+        import os
+        from .transports import AstraReviewSource
+        os.environ["BGKEY"] = "placeholder"
+        self.posts = []
+
+        def post(u, b, h, t):
+            self.posts.append(b)
+            return submit
+
+        return AstraReviewSource(
+            base_url="https://x/v1/responses", model="m", api_key_env="BGKEY",
+            enabled=True, dry_run=False, background=True, poll_interval_s=0.001,
+            transport=post, get_transport=lambda u, h, t: gets.pop(0), **kw)
+
+    def _packet(self):
+        return {"system": "s", "user_text": "u",
+                "response_schema": {"type": "object"}}
+
+    def test_submit_then_poll_returns_the_decision(self):
+        s = self._src({"id": "r1", "status": "queued"},
+                      [{"id": "r1", "status": "completed",
+                        "output_text": '{"mode":"student"}'}])
+        r = s.review(self._packet())
+        assert r["ok"] and r["decision"]["mode"] == "student"
+        assert r["polls"] == 1 and r["response_id"] == "r1"
+
+    def test_an_incomplete_response_is_never_parsed_as_a_decision(self):
+        """It can carry PARTIAL output; a truncated review is not a verdict."""
+        s = self._src({"id": "r1", "status": "queued"},
+                      [{"id": "r1", "status": "incomplete",
+                        "output_text": '{"mode":"student"}',
+                        "incomplete_details": {"reason": "max_output_tokens"}}])
+        r = s.review(self._packet())
+        assert r["ok"] is False
+        assert "incomplete" in r["error"] and "partial output" in r["error"]
+
+    def test_a_failed_review_is_a_failure_not_a_stop_decision(self):
+        s = self._src({"id": "r1", "status": "queued"},
+                      [{"id": "r1", "status": "failed"}])
+        r = self._src({"id": "r1", "status": "queued"},
+                      [{"id": "r1", "status": "failed"}]).review(self._packet())
+        assert r["ok"] is False and "failed" in r["error"]
+
+    def test_a_poll_error_retries_the_GET_and_never_resubmits(self):
+        """Re-POSTing would create a second review: verdict-shopping, and a
+        second charge for an answer already being computed."""
+        calls = {"n": 0}
+
+        def flaky(u, h, t):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("RemoteDisconnected")
+            return {"id": "r1", "status": "completed",
+                    "output_text": '{"mode":"student"}'}
+
+        s = self._src({"id": "r1", "status": "queued"}, [])
+        s.get_transport = flaky
+        r = s.review(self._packet())
+        assert r["ok"] is True
+        assert len(self.posts) == 1, "the review must be submitted exactly once"
+        assert r["polls"] == 3
+
+    def test_the_wall_clock_deadline_is_real(self):
+        """urllib's timeout is per socket operation and never bounded total
+        elapsed time -- that is why a stream could hang past 180 s."""
+        s = self._src({"id": "r1", "status": "queued"},
+                      [], deadline_s=0.05)
+        s.get_transport = lambda u, h, t: {"id": "r1", "status": "in_progress"}
+        r = s.review(self._packet())
+        assert r["ok"] is False and "deadline" in r["error"]
+        assert "may still be running server-side" in r["error"]
+        assert r["wall_clock_s"] >= 0
+
+    def test_background_and_stream_are_mutually_exclusive(self):
+        import pytest as _p
+        from .transports import AstraReviewSource
+        with _p.raises(ValueError) as e:
+            AstraReviewSource(base_url="u", model="m", api_key_env="K",
+                              background=True, stream=True)
+        assert "pick one" in str(e.value)
+
+    def test_background_forces_store_because_an_id_must_be_retrievable(self):
+        from .transports import AstraReviewSource
+        s = AstraReviewSource(base_url="u", model="m", api_key_env="K",
+                              background=True, store=False)
+        body = s.build_body({"system": "s", "user_text": "u",
+                             "response_schema": {}})
+        assert body["background"] is True
+        assert body["store"] is True, "a backgrounded review must be retrievable"
+
+    def test_non_background_body_is_unchanged(self):
+        from .transports import AstraReviewSource
+        s = AstraReviewSource(base_url="u", model="m", api_key_env="K")
+        body = s.build_body({"system": "s", "user_text": "u",
+                             "response_schema": {}})
+        assert "background" not in body and body["store"] is False

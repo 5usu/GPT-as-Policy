@@ -334,7 +334,8 @@ def cmd_live(args: argparse.Namespace) -> int:
     review = AstraReviewSource(
         base_url=args.astra_url, model=args.astra_model,
         api_key_env=args.astra_key_env, enabled=args.astra_live,
-        dry_run=not args.astra_live, reasoning=args.astra_effort)
+        dry_run=not args.astra_live, reasoning=args.astra_effort,
+        background=args.astra_background, deadline_s=args.astra_deadline)
     pipe = PolicyPipeline(resolve_mode(args.policy_mode), backend=backend,
                           shadow=True,
                           astra_review=(review.review if args.astra_live else None))
@@ -717,7 +718,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         base_url=args.astra_url, model=args.astra_model,
         api_key_env=args.astra_key_env, enabled=args.astra_live,
         dry_run=not args.astra_live, reasoning=args.astra_effort,
-        stream=not args.astra_no_stream, attempts=args.astra_attempts)
+        background=args.astra_background, deadline_s=args.astra_deadline,
+        # background and stream are two answers to the same proxy cutoff and
+        # are mutually exclusive; background wins because a stream was measured
+        # hanging past the client timeout rather than failing.
+        stream=(not args.astra_no_stream) and not args.astra_background,
+        attempts=args.astra_attempts)
     ok, why = review.preflight()
     print(f"  astra        : {'LIVE (PAID)' if args.astra_live else 'DRY RUN'} -- {why}"
           f" [{'streamed' if review.stream else 'single response'}]")
@@ -926,6 +932,12 @@ def main(argv=None) -> int:
     rn.add_argument("--monitor-gate", dest="monitor_shadow",
                     action="store_false",
                     help="LET THE MONITOR GATE. Off by default.")
+    rn.add_argument("--astra-background", action="store_true", default=True,
+                    help="submit and poll instead of holding one connection "
+                         "(default on; the proxy cuts held connections at ~60s)")
+    rn.add_argument("--astra-no-background", dest="astra_background",
+                    action="store_false")
+    rn.add_argument("--astra-deadline", type=float, default=300.0)
     rn.add_argument("--astra-live", action="store_true",
                     help="MAKE PAID API CALLS. Off by default.")
     rn.add_argument("--astra-attempts", type=int, default=1,
@@ -968,6 +980,16 @@ def main(argv=None) -> int:
     lv.add_argument("--astra-effort", default="low")
     lv.add_argument("--astra-live", action="store_true",
                     help="make PAID Astra calls; dry-run otherwise")
+    lv.add_argument("--astra-background", action="store_true", default=True,
+                    help="submit and poll instead of holding one connection. "
+                         "DEFAULT ON: the Jetson's outbound proxy was measured "
+                         "cutting a held connection at ~60s while a review "
+                         "needs ~130s, so the non-background path loses an "
+                         "answer it already paid for.")
+    lv.add_argument("--astra-no-background", dest="astra_background",
+                    action="store_false")
+    lv.add_argument("--astra-deadline", type=float, default=300.0,
+                    help="TRUE wall-clock bound across submit+poll")
     lv.add_argument("--model-interval", type=float, default=1.0,
                     help="minimum seconds between model cycles")
     lv.add_argument("--task", default="")
