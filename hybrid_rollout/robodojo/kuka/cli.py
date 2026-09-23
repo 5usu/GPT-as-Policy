@@ -260,6 +260,185 @@ def cmd_gonogo(args: argparse.Namespace) -> int:
 
 
 
+
+def cmd_live(args: argparse.Namespace) -> int:
+    """Three-model loop against the REAL arm. Holds position; sends nothing.
+
+    Live: the RSI session, the measured joint angles, the cameras, pi0.5, the
+    Qwen monitor and Astra. Not live: actuation. See live.py for why motion is
+    structurally impossible here rather than merely disabled.
+    """
+    import socket as _s
+    from . import cell as C
+    from .cameras import LiveCameras, frames_to_data_urls, frames_to_packet_refs
+    from .execution import ExecutionController, ProtocolAdapter
+    from .live import LiveObservationRun, RSI_HEALTHY_HZ
+    from .pipeline import PolicyPipeline, resolve_mode
+    from .transports import AstraReviewSource
+    from .vlm_backends import VlmConfig, make_backend
+
+    if not args.bind:
+        print("REFUSED: binding udp/%d is an action on the robot network.\n"
+              "  Pass --bind to do it. This mode holds position and sends no\n"
+              "  motion, but it DOES take the port, so the teleop RSI driver\n"
+              "  must be stopped first." % C.PORT_RSI_UDP, file=sys.stderr)
+        return 2
+
+    # ---- pi0.5 proposal source ------------------------------------------
+    if args.chunks_file:
+        from .transports import LocalPi05ProposalSource
+        src = LocalPi05ProposalSource.from_file(args.chunks_file)
+        def pi05_infer(obs):
+            return src.propose(obs)
+        pi05_desc = f"REPLAY from {args.chunks_file} (NOT live inference)"
+    elif args.pi05_url:
+        import urllib.request as _u
+        def pi05_infer(obs):
+            body = json.dumps({"images": {}, "state": obs["joints_deg"],
+                               "observation_id": obs["observation_id"]}).encode()
+            req = _u.Request(args.pi05_url, data=body, method="POST",
+                             headers={"Content-Type": "application/json"})
+            with _u.urlopen(req, timeout=args.pi05_timeout) as r:
+                return json.loads(r.read().decode())
+        pi05_desc = f"LIVE via {args.pi05_url}"
+    else:
+        print("REFUSED: no pi0.5 source. Pass --pi05-url (a running server) or\n"
+              "  --chunks-file (replay, which is NOT live inference).\n"
+              "  Note the teleop container serves inference AND owns udp/59152;\n"
+              "  it cannot both be stopped for this test and serve pi0.5, so the\n"
+              "  checkpoint must be served by a separate process.", file=sys.stderr)
+        return 2
+
+    # ---- cameras ---------------------------------------------------------
+    cams = None
+    if args.cameras:
+        mapping = {}
+        for pair in args.cameras.split(","):
+            name, _, node = pair.partition(":")
+            mapping[name.strip()] = int(node)
+        cams = LiveCameras(mapping).start()
+
+    def grab():
+        if cams is None:
+            return [], {}
+        frames = cams.capture()
+        return frames_to_data_urls(frames), frames_to_packet_refs(frames)
+
+    # ---- monitor + astra --------------------------------------------------
+    cfg = VlmConfig.jetson(timeout_s=args.monitor_timeout)
+    if args.monitor_url:
+        cfg = VlmConfig(endpoint=args.monitor_url, model=cfg.model,
+                        api_key_env=cfg.api_key_env,
+                        timeout_s=args.monitor_timeout,
+                        max_frames=cfg.max_frames)
+    backend = make_backend(args.monitor_backend, config=cfg)
+    review = AstraReviewSource(
+        base_url=args.astra_url, model=args.astra_model,
+        api_key_env=args.astra_key_env, enabled=args.astra_live,
+        dry_run=not args.astra_live, reasoning=args.astra_effort,
+        background=args.astra_background, deadline_s=args.astra_deadline)
+    pipe = PolicyPipeline(resolve_mode(args.policy_mode), backend=backend,
+                          shadow=True,
+                          astra_review=(review.review if args.astra_live else None))
+
+    # ---- RSI session ------------------------------------------------------
+    class UdpTransport:
+        def __init__(self, host, port, timeout):
+            self.sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+            try:
+                self.sock.bind((host, port))
+            except OSError as exc:
+                self.sock.close()
+                raise SystemExit(
+                    f"\nCANNOT BIND udp/{port} on {host}: {exc}\n"
+                    f"  Stop the teleop RSI driver first: ss -lunp | grep {port}"
+                    ) from None
+            self.sock.settimeout(timeout)
+
+        def receive(self, timeout_s):
+            try:
+                return self.sock.recvfrom(4096)
+            except (TimeoutError, OSError):
+                return None
+
+        def send(self, payload, peer):
+            self.sock.sendto(payload, peer)
+
+        def close(self):
+            self.sock.close()
+
+    print(f"LIVE OBSERVATION on {args.host}:{C.PORT_RSI_UDP}")
+    print(f"  motion   : IMPOSSIBLE -- holds position, every reply STOPFLAG=1")
+    print(f"  pi0.5    : {pi05_desc}")
+    print(f"  monitor  : {backend.__class__.__name__} ({cfg.model})")
+    print(f"  astra    : {'LIVE (PAID)' if args.astra_live else 'DRY RUN'}")
+    print(f"  cameras  : {args.cameras or 'NONE -- the monitor will be blind'}")
+    print(f"  mode     : {args.policy_mode}")
+    print(f"  audit    : {args.audit}\n")
+    print("  Ctrl-C to stop. Keep this window open: if it exits, nothing\n"
+          "  answers the controller and RSI faults.\n")
+
+    tr = UdpTransport(args.host, C.PORT_RSI_UDP, args.timeout)
+    ctrl = ExecutionController(ProtocolAdapter(tr), allow_motion=False)
+    ctrl.open_session()
+    run = LiveObservationRun(ctrl, pi05_infer=pi05_infer, pipeline=pipe,
+                             grab_frames=grab, audit_path=args.audit,
+                             min_model_interval_s=args.model_interval,
+                             task=args.task or "")
+    t0 = time.time()
+    first = None
+    live_tty = sys.stdout.isatty()
+    win_t, win_n, rate = t0, 0, 0.0
+    started_models = False
+    try:
+        while True:
+            out = run.serve_one(timeout_s=args.timeout)
+            now = time.time()
+            if out is None:
+                if first is None and now - t0 > args.wait:
+                    print("\n  NO FRAMES RECEIVED -- the RSI program is not "
+                          "running or is not pointed here.", file=sys.stderr)
+                    return 2
+                continue
+            if first is None:
+                first = out
+                print(f"  RSI IS RUNNING -- first frame IPOC={out.ipoc}")
+                print(f"  measured joints: "
+                      f"{[round(v, 2) for v in (out.measured or [])]}\n")
+            if not started_models:
+                run.start_models()
+                started_models = True
+            win_n += 1
+            if now - win_t >= 1.0:
+                rate, win_t, win_n = win_n / (now - win_t), now, 0
+            if live_tty and ctrl.adapter.frames_in % 25 == 0:
+                a = ctrl.adapter
+                c = run.cycles[-1] if run.cycles else None
+                tag = "THINKING" if run._thinking.is_set() else "idle    "
+                health = "OK " if rate >= RSI_HEALTHY_HZ else "LOW"
+                sys.stdout.write(
+                    f"\r  [{health}] {rate:6.1f} Hz | frames {a.frames_in:>7}"
+                    f" | {tag} | model {len(run.cycles):>4}"
+                    f" | last {c.total_s if c else '-'}s"
+                    f" | astra {sum(1 for x in run.cycles if x.astra_called):>3}"
+                    f" | {now - t0:6.1f}s  ")
+                sys.stdout.flush()
+    except KeyboardInterrupt:
+        print("\n  interrupted")
+    finally:
+        run.stop()
+        elapsed = time.time() - t0
+        summary = run.summary(elapsed)
+        print("\n" + json.dumps(summary, indent=2))
+        tr.close()
+        if cams is not None:
+            try:
+                cams.stop()
+            except Exception:                                   # noqa: BLE001
+                pass
+    return 0
+
+
 def cmd_hold(args: argparse.Namespace) -> int:
     """HOLD handshake: bind udp/59152, answer every frame, command NOTHING.
 
@@ -286,7 +465,18 @@ def cmd_hold(args: argparse.Namespace) -> int:
     class UdpTransport:
         def __init__(self, host, port, timeout):
             self.sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
-            self.sock.bind((host, port))
+            try:
+                self.sock.bind((host, port))
+            except OSError as exc:
+                self.sock.close()
+                raise SystemExit(
+                    f"\nCANNOT BIND udp/{port} on {host}: {exc}\n"
+                    f"  Only ONE process may own this port. On this cell it is\n"
+                    f"  normally held by the teleop inference container, which\n"
+                    f"  must be stopped first -- and stopping it takes the pi0.5\n"
+                    f"  production path offline for the duration of this test.\n"
+                    f"  Check with:  ss -lunp | grep {port}\n"
+                    f"  If the address itself is wrong, pass --host.") from None
             self.sock.settimeout(timeout)
 
         def receive(self, timeout_s):
@@ -310,11 +500,20 @@ def cmd_hold(args: argparse.Namespace) -> int:
     ctrl.open_session()
     t0 = time.time()
     first = None
+    unlimited = args.frames <= 0
+    wait_forever = args.wait <= 0
+    live = sys.stdout.isatty()
+    win_t, win_n, rate = t0, 0, 0.0
+    last_seen = None
+    gaps = 0
+    print("  Ctrl-C to stop. This window must stay open: the moment it exits,\n"
+          "  nothing answers the controller and RSI faults.\n")
     try:
-        while len(ctrl.outcomes) < args.frames:
+        while unlimited or len(ctrl.outcomes) < args.frames:
             out = ctrl.serve_cycle(timeout_s=args.timeout)
+            now = time.time()
             if out is None:
-                if first is None and time.time() - t0 > args.wait:
+                if first is None and not wait_forever and now - t0 > args.wait:
                     print("  NO FRAMES RECEIVED.", file=sys.stderr)
                     print("  The RSI program is not running, or it is not "
                           "pointed at this host.", file=sys.stderr)
@@ -322,16 +521,31 @@ def cmd_hold(args: argparse.Namespace) -> int:
                           f"tcp/{C.PORT_EXT_TRIGGER_TCP}, then retry.",
                           file=sys.stderr)
                     return 2
+                if first is not None and last_seen and now - last_seen > 0.05:
+                    gaps += 1               # >12 RSI cycles with no frame
+                    last_seen = now
                 continue
             if first is None:
                 first = out
                 print(f"  RSI IS RUNNING -- first frame IPOC={out.ipoc}")
                 print(f"  measured joints: "
-                      f"{[round(v, 2) for v in (out.measured or [])]}")
-            if len(ctrl.outcomes) % 250 == 0:
-                print(f"  {len(ctrl.outcomes)} frames answered ...")
+                      f"{[round(v, 2) for v in (out.measured or [])]}\n")
+            last_seen = now
+            win_n += 1
+            if now - win_t >= 1.0:
+                rate, win_t, win_n = win_n / (now - win_t), now, 0
+            if live and len(ctrl.outcomes) % 25 == 0:
+                a = ctrl.adapter
+                health = "OK " if (rate >= 200 and not a.malformed) else "CHECK"
+                sys.stdout.write(
+                    f"\r  [{health}] {rate:6.1f} Hz | frames {a.frames_in:>7}"
+                    f" in / {a.frames_out:>7} out | ipoc {a.last_ipoc:>8}"
+                    f" | gaps {gaps:>4} jumps {a.ipoc_jumps:>4}"
+                    f" | malformed {a.malformed:>3} stale {a.ipoc_regressions:>4}"
+                    f" | {ctrl.state.value:<9} | {now - t0:6.1f}s  ")
+                sys.stdout.flush()
     except KeyboardInterrupt:
-        print("\n  interrupted")
+        print("\n  interrupted -- controller will see silence from here")
     finally:
         a = ctrl.adapter
         dt = time.time() - t0
@@ -507,7 +721,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         base_url=args.astra_url, model=args.astra_model,
         api_key_env=args.astra_key_env, enabled=args.astra_live,
         dry_run=not args.astra_live, reasoning=args.astra_effort,
-        stream=not args.astra_no_stream, attempts=args.astra_attempts)
+        background=args.astra_background, deadline_s=args.astra_deadline,
+        # background and stream are two answers to the same proxy cutoff and
+        # are mutually exclusive; background wins because a stream was measured
+        # hanging past the client timeout rather than failing.
+        stream=(not args.astra_no_stream) and not args.astra_background,
+        attempts=args.astra_attempts)
     ok, why = review.preflight()
     print(f"  astra        : {'LIVE (PAID)' if args.astra_live else 'DRY RUN'} -- {why}"
           f" [{'streamed' if review.stream else 'single response'}]")
@@ -725,6 +944,12 @@ def main(argv=None) -> int:
     rn.add_argument("--monitor-gate", dest="monitor_shadow",
                     action="store_false",
                     help="LET THE MONITOR GATE. Off by default.")
+    rn.add_argument("--astra-background", action="store_true", default=True,
+                    help="submit and poll instead of holding one connection "
+                         "(default on; the proxy cuts held connections at ~60s)")
+    rn.add_argument("--astra-no-background", dest="astra_background",
+                    action="store_false")
+    rn.add_argument("--astra-deadline", type=float, default=300.0)
     rn.add_argument("--astra-live", action="store_true",
                     help="MAKE PAID API CALLS. Off by default.")
     rn.add_argument("--astra-attempts", type=int, default=1,
@@ -738,10 +963,58 @@ def main(argv=None) -> int:
     rn.add_argument("--audit"); rn.add_argument("--serial")
     rn.set_defaults(func=cmd_run)
 
+    lv = sub.add_parser("live", help="three-model loop on the REAL arm; "
+                                     "holds position, sends no motion")
+    lv.add_argument("--host", default="172.17.255.2")
+    lv.add_argument("--bind", action="store_true",
+                    help="REQUIRED. Binds udp/59152 and answers every frame.")
+    lv.add_argument("--timeout", type=float, default=0.05)
+    lv.add_argument("--wait", type=float, default=300.0,
+                    help="seconds to wait for the first controller frame")
+    lv.add_argument("--pi05-url",
+                    help="a RUNNING pi0.5 server, e.g. http://127.0.0.1:18830/infer. "
+                         "It must be a separate process from the teleop container, "
+                         "which owns udp/59152 and has to be stopped.")
+    lv.add_argument("--pi05-timeout", type=float, default=30.0)
+    lv.add_argument("--chunks-file",
+                    help="replay precomputed chunks instead of inferring. NOT "
+                         "live inference; recorded as such in the audit.")
+    lv.add_argument("--cameras",
+                    help="name:node pairs, e.g. base:0,wrist:2 (on this cell "
+                         "only nodes 0 and 2 capture)")
+    lv.add_argument("--policy-mode", default="pi05_local_monitor_astra")
+    lv.add_argument("--monitor-backend", default="local")
+    lv.add_argument("--monitor-url")
+    lv.add_argument("--monitor-timeout", type=float, default=6.0)
+    lv.add_argument("--astra-url", default="https://api.openai.com/v1/responses")
+    lv.add_argument("--astra-model", default="gpt-6-astra")
+    lv.add_argument("--astra-key-env", default="OPENAI_API_KEY")
+    lv.add_argument("--astra-effort", default="low")
+    lv.add_argument("--astra-live", action="store_true",
+                    help="make PAID Astra calls; dry-run otherwise")
+    lv.add_argument("--astra-background", action="store_true", default=True,
+                    help="submit and poll instead of holding one connection. "
+                         "DEFAULT ON: the Jetson's outbound proxy was measured "
+                         "cutting a held connection at ~60s while a review "
+                         "needs ~130s, so the non-background path loses an "
+                         "answer it already paid for.")
+    lv.add_argument("--astra-no-background", dest="astra_background",
+                    action="store_false")
+    lv.add_argument("--astra-deadline", type=float, default=300.0,
+                    help="TRUE wall-clock bound across submit+poll")
+    lv.add_argument("--model-interval", type=float, default=1.0,
+                    help="minimum seconds between model cycles")
+    lv.add_argument("--task", default="")
+    lv.add_argument("--audit", default="live_observation.jsonl")
+    lv.set_defaults(func=cmd_live)
+
     hd = sub.add_parser("hold", help="HOLD handshake: prove RSI is running, move nothing")
     hd.add_argument("--host", default="172.17.255.2")
-    hd.add_argument("--frames", type=int, default=2500, help="~10s at 250 Hz")
-    hd.add_argument("--wait", type=float, default=10.0)
+    hd.add_argument("--frames", type=int, default=0,
+                    help="0 = run until Ctrl-C (what you want for a wire test)")
+    hd.add_argument("--wait", type=float, default=300.0,
+                    help="seconds to wait for the FIRST frame while the "
+                         "controller side is started; 0 = wait forever")
     hd.add_argument("--timeout", type=float, default=0.05)
     hd.add_argument("--bind", action="store_true",
                     help="REQUIRED. Binds udp/59152 and answers every frame.")

@@ -9,7 +9,8 @@ ONE MODEL, ON THE JETSON: Qwen3-VL-2B-Instruct.
 
 A 2B VLM is chosen over anything larger because this job is *monitoring* -- read
 a scene, report a status -- not reasoning about corrections. The reasoning job
-belongs to Astra, and only on escalation. On an AGX Orin 64 GB, 2B at Q8 is
+belongs to Astra, and only on escalation. THE JETSON MODEL AND MEMORY ARE
+UNKNOWN (see JETSON_COMPUTE); whether a 2B fits, and at what precision, is
 ~2.2 GB, so memory is not the constraint; LATENCY IS, and it must be measured on
 the device rather than assumed.
 
@@ -43,9 +44,43 @@ SCHEMA = "hybrid_rollout.robodojo.kuka.vlm_backends.v1"
 #: A800 is a rented cloud box reachable only over a WAN measured at ~26 KB/s with
 #: 20% loss, where a single four-frame payload takes ~27 s against a 3 s budget.
 #: A remote monitor was never viable for a loop that gates motion.
+#: The board has never been identified. Module/memory decide whether a 2B
+#: runs at all, at what precision, and at what latency -- so the 6 s timeout
+#: and the pacing derived from it are PLACEHOLDERS, not specifications.
+#: Fill these in from the device:
+#:     cat /etc/nv_tegra_release ; cat /proc/device-tree/model ; free -g
+JETSON_COMPUTE = {
+    "board_model": "NVIDIA Jetson AGX Orin Developer Kit (64 GB module)",
+    "total_memory_gb": 61,        # unified: CPU and GPU share it
+    "cpu_cores": 8,
+    "gpu_compute_capability": "8.7",
+    "jetpack_l4t": "R36.5.0 (Jan 2026), Ubuntu 22.04.5, CUDA 12.6",
+    "power_mode": "MODE_30W (mode 2), GPU capped at 612 MHz",
+    "measured_2b_latency_s": None,   # STILL UNMEASURED -- must come from the device
+    "source": "reported from the device by the deployment engineer, 2026-09-23",
+}
+
+
+def compute_is_known() -> tuple[bool, str]:
+    """Fail closed on LATENCY specifically.
+
+    The board is identified now, but capacity is not speed: 61 GiB says a 2B
+    fits, it says nothing about how long it takes at MODE_30W with the GPU at
+    612 MHz. Any rate derived from an unmeasured latency stays a placeholder.
+    """
+    missing = [k for k, v in JETSON_COMPUTE.items()
+               if v is None and k != "source"]
+    if missing:
+        return False, ("Jetson identified, but " + ", ".join(missing) +
+                       " is unmeasured; the 6 s timeout remains a placeholder. "
+                       "Measure it AT the deployed power mode -- a number taken "
+                       "at MAXN does not describe a cell running at 30 W.")
+    return True, "board identified and latency measured on the device"
+
+
 MONITOR_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
 DEFAULT_MODEL = MONITOR_MODEL
-EDGE_MODEL = MONITOR_MODEL          # same model; the Jetson AGX Orin 64GB fits it
+EDGE_MODEL = MONITOR_MODEL          # same model everywhere; see JETSON_COMPUTE
 
 #: Dropped as the edge default at the operator's direction. Recorded because the
 #: reason matters: the shadow run that showed SmolVLM2-500M returning uniform
@@ -192,18 +227,28 @@ class VlmConfig:
 
     @classmethod
     def jetson(cls, *, timeout_s: float = 12.0) -> "VlmConfig":
-        """Jetson AGX Orin 64 GB running Qwen3-VL-2B.
+        """The Jetson running Qwen3-VL-2B (board recorded in JETSON_COMPUTE).
 
-        12 s comes from MEASUREMENT on this device, replacing the 6 s starting
-        point: at MODE_30W (GPU 612 MHz, clocks pinned) with a 2-frame temporal
-        pair, one observation took 5.1 s min / 6.7 s median / 9.1 s max over 7
-        looks across 2 episodes. At 6 s every reading fail-safed to HOLD.
+        12 s and a 2-frame pair come from MEASUREMENT on this device, replacing
+        the 6 s / 4-frame starting point. At MODE_30W (GPU 612 MHz, clocks
+        pinned via jetson_clocks; MAXN needs a reboot and was not taken):
+
+          4 frames, 6 s    8 of 8 readings TIMED OUT. Prefill alone is ~6 s --
+                           ~1950 prompt tokens at ~300 tok/s -- so generation
+                           had not begun when the client gave up.
+          2 frames, 12 s   13 of 13 readings completed over 3 episodes,
+                           5.1 s min / 6.7 s median / 9.1 s max.
 
         WHERE THE TIME GOES, because it decides what to tune next: prefill is
         ~1.7 s (750 tokens at ~450 tok/s) and generation is ~5.4-7.4 s (about
         105 tokens at 15-19 tok/s). Generation dominates, so fewer frames buy
         little further; a shorter response schema, a smaller quant or a higher
-        GPU clock (MAXN needs a reboot) are the levers that remain.
+        GPU clock are the levers that remain. JPEG frames do not help HERE --
+        the monitor is local, so payload size costs nothing on loopback; that
+        saving belongs to Astra, which is remote.
+
+        A pair is ONE camera at t-1 and t. Two cameras at one instant is not a
+        time sequence, and the CLI orders frames so truncation keeps the pair.
         """
         return cls(model=MONITOR_MODEL, timeout_s=timeout_s, max_frames=2)
 

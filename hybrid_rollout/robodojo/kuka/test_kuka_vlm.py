@@ -23,7 +23,7 @@ def fast_schedule():
     """Evaluate on every synthetic tick.
 
     The shipped default is paced from MEASURED device latency (~6 s for a 2B on
-    an AGX Orin), so a test advancing `now` by one second would never come due.
+    the device), so a test advancing `now` by one second would never come due.
     These tests exercise gate logic, not scheduling; TestSchedulingStaysOutOfThe
     ControlLoop covers the real pacing.
     """
@@ -1023,3 +1023,28 @@ class TestAstraIsNotPolled:
 
     def test_default_policy_is_transition_only(self):
         assert MonitorPolicy().astra_recall_every == 0
+
+
+class TestHardwareClaimsAreSourced:
+    """A hardware number may be stated only if something reported it."""
+
+    def test_board_is_identified_and_carries_its_source(self):
+        from .vlm_backends import JETSON_COMPUTE
+        assert "AGX Orin" in JETSON_COMPUTE["board_model"]
+        assert JETSON_COMPUTE["total_memory_gb"] == 61
+        assert "reported from the device" in JETSON_COMPUTE["source"], \
+            "a spec with no stated source is an assumption"
+
+    def test_latency_is_still_unmeasured_and_gates_closed(self):
+        """Capacity is not speed. 61 GiB says a 2B FITS; it says nothing
+        about how long it takes at MODE_30W with the GPU at 612 MHz."""
+        from .vlm_backends import compute_is_known, JETSON_COMPUTE
+        assert JETSON_COMPUTE["measured_2b_latency_s"] is None
+        ok, why = compute_is_known()
+        assert ok is False and "placeholder" in why
+
+    def test_the_deployed_power_mode_is_recorded_with_the_board(self):
+        """A latency taken at MAXN does not describe a cell running at 30 W."""
+        from .vlm_backends import JETSON_COMPUTE
+        assert "30W" in JETSON_COMPUTE["power_mode"]
+        assert "612" in JETSON_COMPUTE["power_mode"]

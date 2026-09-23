@@ -270,7 +270,9 @@ class AstraReviewSource:
                  enabled: bool = False, dry_run: bool = True,
                  reasoning: str | None = None, store: bool = False,
                  timeout: float = 180.0, transport=None,
-                 stream: bool = False, attempts: int = 1) -> None:
+                 stream: bool = False, attempts: int = 1,
+                 background: bool = False, deadline_s: float = 300.0,
+                 poll_interval_s: float = 2.0, get_transport=None) -> None:
         self.base_url = base_url
         self.model = model
         self.api_key_env = api_key_env
@@ -290,6 +292,70 @@ class AstraReviewSource:
         # `stop` and including unparseable prose. Re-asking an answered review
         # would be shopping for a verdict. Default 1 = the original behaviour.
         self.attempts = max(1, int(attempts))
+        # BACKGROUND MODE. The measured outbound proxy on the Jetson cuts a
+        # connection at ~60 s while a real review needs ~130 s, so a single
+        # long-held request loses an answer that was already paid for.
+        # Submitting and polling keeps every HTTP call short (~1.75 s measured),
+        # which is under any cutoff the proxy applies.
+        if background and stream:
+            raise ValueError(
+                "background and stream are two different answers to the same "
+                "proxy cutoff; pick one. stream keeps one connection alive and "
+                "was measured to hang indefinitely, so background is preferred.")
+        self.background = bool(background)
+        #: TRUE wall-clock bound across submit+poll. `timeout` is a per-HTTP-call
+        #: socket timeout and never bounded total elapsed time -- urllib's
+        #: timeout is per socket operation, so an SSE keep-alive reset it on
+        #: every event and a stream could hang forever.
+        self.deadline_s = float(deadline_s)
+        self.poll_interval_s = max(0.25, float(poll_interval_s))
+        self.get_transport = get_transport
+
+    def _await_terminal(self, submitted: dict, headers: dict,
+                        started: float) -> tuple[dict | None, int, str]:
+        """Poll one submitted review to a terminal state.
+
+        NEVER re-POSTs. A failed poll retries the GET; re-submitting would
+        create a SECOND review -- both verdict-shopping under the no-reask rule
+        and a second charge for an answer already being computed.
+        """
+        import time as _t
+        rid = submitted.get("id") if isinstance(submitted, dict) else None
+        status = str(submitted.get("status", "")) if isinstance(submitted, dict) else ""
+        if not rid:
+            return None, 0, f"background submit returned no id: {submitted!r}"[:300]
+        if status == _TERMINAL_OK:
+            return submitted, 0, ""              # already done; nothing to poll
+        url = self.base_url.rstrip("/") + "/" + str(rid)
+        getter = self.get_transport or _urllib_get
+        polls, last_err = 0, ""
+        while True:
+            remaining = self.deadline_s - (_t.monotonic() - started)
+            if remaining <= 0:
+                return None, polls, (
+                    f"wall-clock deadline of {self.deadline_s:.0f}s reached "
+                    f"after {polls} polls; review {rid} may still be running "
+                    f"server-side" + (f" (last poll error: {last_err})"
+                                      if last_err else ""))
+            _t.sleep(min(self.poll_interval_s, remaining))
+            polls += 1
+            try:
+                got = getter(url, headers, min(self.timeout, max(1.0, remaining)))
+            except Exception as exc:                            # noqa: BLE001
+                last_err = f"{type(exc).__name__}: {exc}"[:160]
+                continue                         # retry the GET, never the POST
+            st = str(got.get("status", "")) if isinstance(got, dict) else ""
+            if st == _TERMINAL_OK:
+                return got, polls, ""
+            if st in _TERMINAL_BAD:
+                detail = ""
+                if isinstance(got, dict):
+                    detail = str(got.get("incomplete_details")
+                                 or got.get("error") or "")[:200]
+                return None, polls, (
+                    f"review {rid} ended {st!r}; refusing to parse it as a "
+                    f"decision (an incomplete response can carry partial "
+                    f"output). {detail}")
 
     def preflight(self) -> tuple[bool, str]:
         if not self.enabled:
@@ -309,7 +375,12 @@ class AstraReviewSource:
                       {"role": "user", "content": content}],
             "text": {"format": {"type": "json_schema", "name": "kuka_action_review",
                                 "schema": packet["response_schema"], "strict": True}},
-            "store": bool(self.store)}
+            # A backgrounded response must be retrievable by id, which requires
+            # server-side storage. Recorded here rather than flipped silently:
+            # store=False was a deliberate retention choice.
+            "store": bool(self.store or self.background)}
+        if self.background:
+            body["background"] = True
         if self.reasoning:
             body["reasoning"] = {"effort": self.reasoning}
         return body
@@ -336,6 +407,8 @@ class AstraReviewSource:
         poster = self.transport or (_urllib_post_stream if self.stream else _urllib_post)
         headers = {"Authorization": f"Bearer {os.environ[self.api_key_env]}",
                    "Content-Type": "application/json"}
+        import time as _t
+        started = _t.monotonic()
         used = 0
         for used in range(1, self.attempts + 1):
             try:
@@ -345,10 +418,21 @@ class AstraReviewSource:
                 if used >= self.attempts:
                     return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300],
                             "body_sha256_12": digest, "attempts_used": used}
+        polls = 0
+        response_id = raw.get("id") if isinstance(raw, dict) else None
+        if self.background:
+            raw, polls, why = self._await_terminal(raw, headers, started)
+            if raw is None:
+                return {"ok": False, "error": why, "body_sha256_12": digest,
+                        "attempts_used": used, "response_id": response_id,
+                        "polls": polls,
+                        "wall_clock_s": round(_t.monotonic() - started, 2)}
+
         text, usage = _extract_text(raw)
         if text is None:
             return {"ok": False, "error": "no text in response", "usage": usage,
-                    "body_sha256_12": digest, "attempts_used": used}
+                    "body_sha256_12": digest, "attempts_used": used,
+                    "response_id": response_id, "polls": polls}
         try:
             decision = _json.loads(text)
         except Exception:
@@ -357,7 +441,34 @@ class AstraReviewSource:
                     "attempts_used": used}
         return {"ok": True, "decision": decision, "usage": usage,
                 "source": self.name, "is_live": True, "body_sha256_12": digest,
-                "attempts_used": used}
+                "attempts_used": used, "response_id": response_id,
+                "polls": polls,
+                "wall_clock_s": round(_t.monotonic() - started, 2)}
+
+
+#: Terminal statuses. Only "completed" may be parsed as a decision -- an
+#: "incomplete" response can carry PARTIAL output, and _extract_text would
+#: happily return it, turning a truncated review into a full verdict.
+_TERMINAL_OK = "completed"
+_TERMINAL_BAD = ("failed", "incomplete", "cancelled", "expired")
+
+
+def _urllib_get(url: str, headers: dict, timeout: float) -> dict:
+    """One GET. Same no-retry contract as _urllib_post."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return _json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:1500]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code} {e.reason}: {detail}") from None
 
 
 def _urllib_post(url: str, body: dict, headers: dict, timeout: float) -> dict:

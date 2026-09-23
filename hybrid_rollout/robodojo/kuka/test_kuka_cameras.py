@@ -107,10 +107,10 @@ class TestPacketInterop:
             assert r["frame_present"] is True and r["live"] is True
             assert "frame_index" in r and "grabbed_epoch" in r
 
-    def test_data_urls_are_sorted_and_png(self):
+    def test_data_urls_are_sorted_and_jpeg(self):
         urls = frames_to_data_urls({"wrist": frame("wrist"), "base": frame("base")})
         assert len(urls) == 2
-        assert all(u.startswith("data:image/png;base64,") for u in urls)
+        assert all(u.startswith("data:image/jpeg;base64,") for u in urls)
 
     def test_build_packet_accepts_live_refs(self):
         from .packet import build_packet
@@ -136,3 +136,21 @@ class TestRecordedCameras:
     def test_same_interface_as_live(self):
         assert hasattr(RecordedCameras("/tmp"), "snapshot")
         assert hasattr(LiveCameras(), "snapshot")
+
+
+class TestWireEncodingIsCheapAndHonest:
+    """Payload size dominates review latency through the Jetson's proxy."""
+
+    def test_frames_go_out_as_jpeg_not_png(self):
+        from .cameras import ENCODE_EXT, ENCODE_MIME
+        assert ENCODE_EXT == ".jpg" and ENCODE_MIME == "image/jpeg"
+
+    def test_the_lossy_re_encode_is_recorded_in_provenance(self):
+        """The reviewer judges a re-encoding, not the sensor data. Say so."""
+        from .cameras import ENCODE_QUALITY, Frame, frames_to_packet_refs
+        f = Frame("base", b"\xff\xd8\xff", 1.0, 2.0, 1, 640, 480)
+        meta = frames_to_packet_refs({"base": f})["base"]
+        assert meta["encoding"] == "image/jpeg"
+        assert meta["lossy"] is True
+        assert meta["quality"] == ENCODE_QUALITY
+        assert meta["bytes"] == 3

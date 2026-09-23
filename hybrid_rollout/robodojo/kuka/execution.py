@@ -99,6 +99,10 @@ class ProtocolAdapter:
         self.malformed = 0
         self.ipoc_regressions = 0
         self.ipoc_jumps = 0
+        #: True when the frame just returned by poll() had a stale or repeated
+        #: IPOC. The frame is still ANSWERED -- silence faults the controller --
+        #: but it must never advance a command. See poll().
+        self.stale_frame = False
 
     def poll(self, timeout_s: float) -> tuple[int, list[float], Any] | None:
         got = self.transport.receive(timeout_s)
@@ -110,10 +114,19 @@ class ProtocolAdapter:
         if ipoc is None or joints is None:
             self.malformed += 1
             return None
+        self.stale_frame = False
         if self.last_ipoc is not None:
             if ipoc <= self.last_ipoc:
+                # ANSWER IT ANYWAY. Declining to reply is not a safe default:
+                # RSI requires a reply every cycle and silence faults the
+                # controller, so refusing to answer a duplicate turns a
+                # harmless reordered packet into a fault. What must not happen
+                # is CONSUMING A COMMAND on a stale frame -- the reply is echoed
+                # with this frame's own IPOC, so it can never be misapplied to
+                # another cycle. serve_cycle holds position on these.
                 self.ipoc_regressions += 1
-                return None                     # stale/replayed: do not answer it
+                self.stale_frame = True
+                return ipoc, joints, peer
             if ipoc - self.last_ipoc > self.max_ipoc_gap:
                 self.ipoc_jumps += 1            # answered, but counted
         self.last_ipoc = ipoc
@@ -309,6 +322,15 @@ class ExecutionController:
         commanded: list[float] | None = None
         verdict = None
         reason = self.fault_reason or self.hold_reason
+
+        if self.adapter.stale_frame and self.state is State.EXECUTING:
+            # Answer with the measured pose; do not pop the queue.
+            self.adapter.reply(ipoc, measured, stopflag=STOPFLAG_STOP, peer=peer)
+            out = FrameOutcome(ipoc, self.state.value, STOPFLAG_STOP, None,
+                               list(measured), "stale ipoc: held, not commanded",
+                               None)
+            self.outcomes.append(out)
+            return out
 
         if self.state is State.EXECUTING and self._queue:
             commanded = self._queue.pop(0)

@@ -46,6 +46,34 @@ WIDTH, HEIGHT, FPS = 640, 480, 30
 DEFAULT_MAX_AGE_S = 0.25          # ~7 frames at 30 fps
 
 
+#: Wire encoding for frames sent to a reviewer.
+#:
+#: JPEG, not PNG. Measured on this cell: one review request shrank from 761 KB
+#: to 95 KB and about 6 s of upload disappeared with it. Through the Jetson's
+#: outbound proxy -- measured at 26 KB/s -- payload size is the dominant term
+#: in review latency, not model time.
+#:
+#: This is LOSSY. What the reviewer judges is a re-encoded rendering of what
+#: the camera saw, not the sensor data. The quality factor is pinned here so
+#: that rendering is reproducible, and frames_to_packet_refs records the
+#: encoding alongside the frame so provenance is not silently lost.
+ENCODE_QUALITY = 85
+ENCODE_EXT = ".jpg"
+ENCODE_MIME = "image/jpeg"
+ENCODE_PARAMS: tuple = ()   # filled below once cv2 is importable
+
+
+def _encode_params():
+    try:
+        import cv2
+        return (cv2.IMWRITE_JPEG_QUALITY, ENCODE_QUALITY)
+    except Exception:                                          # noqa: BLE001
+        return ()
+
+
+ENCODE_PARAMS = _encode_params()
+
+
 class CameraError(RuntimeError):
     """A camera could not be opened, or produced nothing."""
 
@@ -113,9 +141,9 @@ class _Grabber:
                     self._error = "read failed"
                     time.sleep(0.01)
                     continue
-                ok, buf = cv2.imencode(".png", img)
+                ok, buf = cv2.imencode(ENCODE_EXT, img, ENCODE_PARAMS)
                 if not ok:
-                    self._error = "png encode failed"
+                    self._error = f"{ENCODE_EXT} encode failed"
                     continue
                 n += 1
                 f = Frame(self.name, buf.tobytes(), time.monotonic(), time.time(),
@@ -231,13 +259,15 @@ class RecordedCameras:
 def frames_to_packet_refs(frames: dict[str, Frame]) -> dict[str, Any]:
     """Shape `packet.build_packet` expects, from live frames."""
     return {name: {"frame_index": f.frame_id, "frame_present": True,
-                   "grabbed_epoch": f.grabbed_epoch, "live": True}
+                   "grabbed_epoch": f.grabbed_epoch, "live": True,
+                   "encoding": ENCODE_MIME, "lossy": ENCODE_EXT != ".png",
+                   "quality": ENCODE_QUALITY, "bytes": len(f.png or b"")}
             for name, f in frames.items()}
 
 
 def frames_to_data_urls(frames: dict[str, Frame]) -> list[str]:
     import base64
-    return ["data:image/png;base64," + base64.b64encode(f.png).decode()
+    return [f"data:{ENCODE_MIME};base64," + base64.b64encode(f.png).decode()
             for _, f in sorted(frames.items()) if f.png]
 
 

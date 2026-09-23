@@ -11,7 +11,8 @@ COMPAT_ALIASES records the mapping explicitly.
                                No monitor, no Astra. This is the existing
                                behaviour and its semantics are unchanged.
     pi05_local_monitor         a local VLM watches at its MEASURED rate (a 2B
-                               on an AGX Orin is ~0.2 Hz, not 2-5) or on semantic
+                               2B on an unidentified board; ~0.2 Hz is a
+                               PLACEHOLDER, not 2-5) or on semantic
                                events and gates the prefix length. Never calls
                                Astra, never commands.
     pi05_local_monitor_astra   as above, plus escalation to Astra on PERSISTENT
