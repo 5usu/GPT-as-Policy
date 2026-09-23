@@ -1010,21 +1010,25 @@ class TestAstraIsNotPolled:
 
 
 class TestHardwareClaimsAreSourced:
-    """A hardware spec nobody reported must not read as a measurement."""
+    """A hardware number may be stated only if something reported it."""
 
-    def test_unidentified_board_is_declared_not_assumed(self):
+    def test_board_is_identified_and_carries_its_source(self):
+        from .vlm_backends import JETSON_COMPUTE
+        assert "AGX Orin" in JETSON_COMPUTE["board_model"]
+        assert JETSON_COMPUTE["total_memory_gb"] == 61
+        assert "reported from the device" in JETSON_COMPUTE["source"], \
+            "a spec with no stated source is an assumption"
+
+    def test_latency_is_still_unmeasured_and_gates_closed(self):
+        """Capacity is not speed. 61 GiB says a 2B FITS; it says nothing
+        about how long it takes at MODE_30W with the GPU at 612 MHz."""
         from .vlm_backends import compute_is_known, JETSON_COMPUTE
+        assert JETSON_COMPUTE["measured_2b_latency_s"] is None
         ok, why = compute_is_known()
         assert ok is False and "placeholder" in why
-        assert JETSON_COMPUTE["board_model"] is None
-        assert "may be assumed" in JETSON_COMPUTE["source"]
 
-    def test_no_board_model_is_hardcoded_anywhere(self):
-        """Regression: 'AGX Orin 64 GB' was asserted without a source."""
-        import pathlib
-        here = pathlib.Path(__file__).parent
-        for f in here.glob("*.py"):
-            text = f.read_text()
-            for claim in ("AGX Orin", "Orin Nano", "Xavier"):
-                assert claim not in text, \
-                    f"{f.name} states a board model; none has been reported"
+    def test_the_deployed_power_mode_is_recorded_with_the_board(self):
+        """A latency taken at MAXN does not describe a cell running at 30 W."""
+        from .vlm_backends import JETSON_COMPUTE
+        assert "30W" in JETSON_COMPUTE["power_mode"]
+        assert "612" in JETSON_COMPUTE["power_mode"]

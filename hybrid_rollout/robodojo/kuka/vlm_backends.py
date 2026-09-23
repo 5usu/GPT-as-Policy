@@ -50,23 +50,32 @@ SCHEMA = "hybrid_rollout.robodojo.kuka.vlm_backends.v1"
 #: Fill these in from the device:
 #:     cat /etc/nv_tegra_release ; cat /proc/device-tree/model ; free -g
 JETSON_COMPUTE = {
-    "board_model": None,          # e.g. "NVIDIA Jetson AGX Orin 64GB"
-    "total_memory_gb": None,
-    "jetpack_l4t": None,
-    "power_mode": None,           # nvpmodel -q  (do NOT change it)
-    "measured_2b_latency_s": None,
-    "source": "not reported from the device; no value here may be assumed",
+    "board_model": "NVIDIA Jetson AGX Orin Developer Kit (64 GB module)",
+    "total_memory_gb": 61,        # unified: CPU and GPU share it
+    "cpu_cores": 8,
+    "gpu_compute_capability": "8.7",
+    "jetpack_l4t": "R36.5.0 (Jan 2026), Ubuntu 22.04.5, CUDA 12.6",
+    "power_mode": "MODE_30W (mode 2), GPU capped at 612 MHz",
+    "measured_2b_latency_s": None,   # STILL UNMEASURED -- must come from the device
+    "source": "reported from the device by the deployment engineer, 2026-09-23",
 }
 
 
 def compute_is_known() -> tuple[bool, str]:
-    """Fail closed: refuse to present latency claims as specifications."""
+    """Fail closed on LATENCY specifically.
+
+    The board is identified now, but capacity is not speed: 61 GiB says a 2B
+    fits, it says nothing about how long it takes at MODE_30W with the GPU at
+    612 MHz. Any rate derived from an unmeasured latency stays a placeholder.
+    """
     missing = [k for k, v in JETSON_COMPUTE.items()
                if v is None and k != "source"]
     if missing:
-        return False, ("Jetson compute unidentified (" + ", ".join(missing) +
-                       "); the 6 s timeout is a placeholder, not a measurement")
-    return True, "Jetson compute reported from the device"
+        return False, ("Jetson identified, but " + ", ".join(missing) +
+                       " is unmeasured; the 6 s timeout remains a placeholder. "
+                       "Measure it AT the deployed power mode -- a number taken "
+                       "at MAXN does not describe a cell running at 30 W.")
+    return True, "board identified and latency measured on the device"
 
 
 MONITOR_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
