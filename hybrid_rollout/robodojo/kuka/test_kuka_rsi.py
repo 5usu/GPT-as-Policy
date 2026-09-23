@@ -273,3 +273,75 @@ class TestControlledStop:
             assert [round(v, 3) for v in c.joints] == [round(v, 3) for v in pos]
         finally:
             c.close(); g.close()
+
+
+class TestRuckigIsNowActuallyBuildable:
+    """The gateway used to refuse motion because RuckigInterpolator could not
+    be constructed -- while otg.RuckigOTG sat in the same package, complete.
+    That was an artificial blocker. The LIMITS gate is the real one."""
+
+    LIMITS = {
+        "max_velocity_deg_s": [85.0, 40.0, 125.0, 125.0, 125.0, 320.0],
+        "max_acceleration_deg_s2": [800.0, 250.0, 500.0, 1200.0, 1200.0, 2500.0],
+        "max_jerk_deg_s3": [12000.0, 12000.0, 15000.0, 20000.0, 20000.0, 40000.0],
+    }
+
+    def test_it_builds_from_a_validated_config(self):
+        from .rsi_gateway import RuckigInterpolator
+        r = RuckigInterpolator.from_config(dict(self.LIMITS))
+        assert r.deployable and r.generator is not None
+
+    def test_it_produces_a_jerk_limited_profile_that_reaches_the_target(self):
+        from .rsi_gateway import RuckigInterpolator
+        r = RuckigInterpolator.from_config(dict(self.LIMITS))
+        rows = r([0.0] * 6, [5.0, 2.0, 0.0, 0.0, 0.0, 0.0], None)
+        assert len(rows) > 1
+        assert rows[-1][0] == pytest.approx(5.0, abs=1e-3)
+        assert rows[-1][1] == pytest.approx(2.0, abs=1e-3)
+
+    def test_the_profile_respects_the_velocity_cap(self):
+        """The property linear interpolation cannot give: no step implies a
+        velocity above the joint's measured limit."""
+        from .rsi_gateway import RuckigInterpolator
+        r = RuckigInterpolator.from_config(dict(self.LIMITS))
+        rows = r([0.0] * 6, [30.0, 10.0, 0.0, 0.0, 0.0, 0.0], None)
+        for j in range(2):
+            peak = max(abs(rows[i + 1][j] - rows[i][j]) / 0.004
+                       for i in range(len(rows) - 1))
+            assert peak <= self.LIMITS["max_velocity_deg_s"][j] * 1.02, \
+                f"joint {j+1} exceeded its measured velocity cap"
+
+    def test_missing_limits_still_refuse_and_name_what_is_missing(self):
+        from .otg import LimitsMissing
+        from .rsi_gateway import RuckigInterpolator
+        with pytest.raises(LimitsMissing) as e:
+            RuckigInterpolator.from_config({})
+        assert set(e.value.missing) == {
+            "max_velocity_deg_s", "max_acceleration_deg_s2", "max_jerk_deg_s3"}
+
+    def test_a_partial_limit_set_is_not_enough(self):
+        from .otg import LimitsMissing
+        from .rsi_gateway import RuckigInterpolator
+        with pytest.raises(LimitsMissing):
+            RuckigInterpolator.from_config(
+                {"max_velocity_deg_s": self.LIMITS["max_velocity_deg_s"]})
+
+    def test_for_motion_is_the_only_road_to_enable_motion(self):
+        from .rsi_gateway import RSIGateway
+        gw = RSIGateway.for_motion(dict(self.LIMITS), sock=object())
+        assert gw.enable_motion is True
+        assert gw.interpolator.name == "ruckig"
+
+    def test_for_motion_refuses_without_measured_limits(self):
+        from .otg import LimitsMissing
+        from .rsi_gateway import RSIGateway
+        with pytest.raises(LimitsMissing):
+            RSIGateway.for_motion({}, sock=object())
+
+    def test_linear_can_still_never_move_the_arm(self):
+        from .rsi_gateway import ArmingRefused, LinearInterpolator, RSIGateway
+        with pytest.raises(ArmingRefused) as e:
+            RSIGateway(enable_motion=True, interpolator=LinearInterpolator(),
+                       sock=object())
+        assert e.value.code == "interpolator_not_deployable"
+        assert "velocity-discontinuous" in str(e.value)

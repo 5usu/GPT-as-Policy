@@ -121,11 +121,17 @@ class LinearInterpolator:
 
 
 class RuckigInterpolator:
-    """Adapter for the deployed jerk-limited generator.
+    """The deployed jerk-limited generator.
 
-    Not implemented here: Ruckig is the deployment engineer's component and
-    lives on the Jetson. This adapter exists so the gateway can REQUIRE it by
-    name rather than silently substituting something else.
+    This USED to say Ruckig was the engineer's component and refuse without an
+    injected generator -- while otg.RuckigOTG sat in the same package, fully
+    implemented against the real `ruckig` wheel. That was an artificial
+    blocker, and it is removed: from_config() below builds the real generator.
+
+    What is NOT removed is the limits requirement. Ruckig without per-joint
+    velocity, acceleration and jerk limits is not a safety property, it is a
+    shape; from_config raises LimitsMissing rather than substitute a plausible
+    number. That gate is real and stays.
     """
 
     name = "ruckig"
@@ -134,13 +140,27 @@ class RuckigInterpolator:
     def __init__(self, generator=None) -> None:
         self.generator = generator
 
+    @classmethod
+    def from_config(cls, cfg: dict) -> "RuckigInterpolator":
+        """Build the real Ruckig(6, 0.004) from VALIDATED limits.
+
+        Raises otg.LimitsMissing when any limit is absent or malformed -- the
+        limits are physical measurements of this cell, and this package will
+        not invent them.
+        """
+        from .otg import JointLimits, RuckigOTG
+        otg = RuckigOTG(JointLimits.from_config(cfg))
+        if not otg.deployable:
+            raise RuntimeError(otg.reason_not_deployable)
+        return cls(otg)
+
     def __call__(self, start, target, cycles):
         if self.generator is None:
             raise RuntimeError(
-                "RuckigInterpolator has no generator. Supply the Jetson's "
-                "Ruckig(NUM_JOINTS, 0.004) instance; this package does not "
-                "reimplement it and will not substitute linear interpolation "
-                "for real motion.")
+                "RuckigInterpolator has no generator. Build it with "
+                "RuckigInterpolator.from_config(validated_deployment_config); "
+                "this package will not substitute linear interpolation for "
+                "real motion.")
         return self.generator(start, target, cycles)
 
 
@@ -307,6 +327,17 @@ class RSIGateway:
         self._stop = False
         self._last_measured: list[float] | None = None
         self._last_frame_at: float | None = None
+
+    @classmethod
+    def for_motion(cls, cfg: dict, **kw) -> "RSIGateway":
+        """A gateway permitted to move, built from a VALIDATED config.
+
+        The only supported way to reach enable_motion=True. Raises
+        otg.LimitsMissing if the cell's measured limits are absent, so the
+        refusal happens here rather than as a surprise on the arm.
+        """
+        kw.setdefault("interpolator", RuckigInterpolator.from_config(cfg))
+        return cls(enable_motion=True, **kw)
 
     def _interp(self, start, target, cycles):
         return self.interpolator(start, target, cycles)

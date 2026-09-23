@@ -90,9 +90,15 @@ class TestInterpolationIsNotFaked:
         assert e.value.code == "interpolator_not_deployable"
 
     def test_ruckig_without_a_generator_refuses_rather_than_substituting(self):
+        """Still refuses -- but the message now points at the real builder.
+
+        The package DOES implement Ruckig (otg.RuckigOTG, against the real
+        wheel); what it will not do is run it without this cell's measured
+        limits, or fall back to linear."""
         with pytest.raises(RuntimeError) as e:
             RuckigInterpolator()([0] * 6, [1] * 6, 8)
-        assert "does not reimplement" in str(e.value)
+        assert "from_config" in str(e.value)
+        assert "will not substitute linear" in str(e.value)
 
     def test_motion_allowed_with_a_deployable_interpolator(self):
         g = RSIGateway(enable_motion=True, secret=b"x",
