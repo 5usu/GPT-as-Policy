@@ -261,3 +261,117 @@ class TestBlindInferenceIsRefused:
         t.join(timeout=2.0)
         assert "base" in seen, "pi0.5 must receive frames keyed by camera name"
         assert seen["base"].startswith("data:image/jpeg")
+
+class TestLiveCameraCallsExist:
+    """The live loop must only call methods LiveCameras actually has.
+
+    FOUND ON THE REAL ARM: `cli live` called cams.capture(), which does not
+    exist -- the class exposes snapshot(). Every model cycle raised
+    AttributeError and was swallowed into the per-cycle error field, so the
+    RSI loop ran at a healthy 250 Hz while 228 consecutive cycles produced no
+    observation, no monitor reading and no Astra call. The run looked alive.
+
+    A type checker would catch this; this test is the cheap equivalent, and it
+    fails on the NAME rather than on behaviour so it cannot rot into a mock.
+    """
+
+    def test_every_camera_method_the_cli_calls_exists(self):
+        import ast
+        import inspect
+        from pathlib import Path
+        from .cameras import LiveCameras
+        src = Path(inspect.getfile(LiveCameras)).parent / "cli.py"
+        tree = ast.parse(src.read_text())
+        called = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in ("cams", "cameras")
+        }
+        missing = sorted(m for m in called if not hasattr(LiveCameras, m))
+        assert not missing, (
+            f"cli.py calls {missing} on LiveCameras, which has "
+            f"{sorted(m for m in dir(LiveCameras) if not m.startswith('_'))}")
+
+
+class TestChunkReplayInLiveMode:
+    """--chunks-file must work in `cli live`, where observation ids are new.
+
+    FOUND ON THE REAL ARM: live.py names each observation `live:{ipoc}` from the
+    controller's counter, while LocalPi05ProposalSource looks chunks up BY id.
+    A recorded file is keyed `<episode>:t000050`, so every lookup missed and all
+    150 cycles failed with "no proposal for live:86302460". The help advertises
+    the flag as "replay precomputed chunks instead of inferring", so replay must
+    not depend on ids it cannot know.
+
+    Sequential replay is opt-in: `cli run` DOES have matching ids and must keep
+    its keyed lookup, where a missing chunk is a real error worth reporting.
+    """
+
+    CHUNKS = {"ep:t000000": [[1.0] * 7] * 50,
+              "ep:t000050": [[2.0] * 7] * 50,
+              "_meta": {"use_relative_actions": True}}
+
+    def _src(self, **kw):
+        from .transports import LocalPi05ProposalSource
+        return LocalPi05ProposalSource(chunks={k: v for k, v in self.CHUNKS.items()
+                                               if not k.startswith("_")}, **kw)
+
+    def test_sequential_replay_ignores_the_id_and_serves_in_order(self):
+        s = self._src(sequential=True)
+        first = s.propose({"observation_id": "live:86302460"})
+        second = s.propose({"observation_id": "live:86302461"})
+        assert first["ok"] is True and second["ok"] is True
+        assert first["rows"][0][0] == 1.0
+        assert second["rows"][0][0] == 2.0
+
+    def test_sequential_replay_cycles_rather_than_running_dry(self):
+        s = self._src(sequential=True)
+        served = [s.propose({"observation_id": f"live:{i}"}) for i in range(5)]
+        assert all(r["ok"] for r in served), "a long session must not run out"
+        assert [r["rows"][0][0] for r in served] == [1.0, 2.0, 1.0, 2.0, 1.0]
+
+    def test_sequential_replay_says_which_recorded_chunk_it_served(self):
+        """The audit must not imply this came from the live scene."""
+        r = self._src(sequential=True).propose({"observation_id": "live:1"})
+        assert r.get("replayed_from") == "ep:t000000"
+
+    def test_keyed_lookup_is_unchanged_when_sequential_is_off(self):
+        s = self._src()
+        assert s.propose({"observation_id": "ep:t000050"})["ok"] is True
+        miss = s.propose({"observation_id": "live:86302460"})
+        assert miss["ok"] is False and "no proposal" in miss["error"]
+
+
+class TestLiveMonitorTimeoutMatchesTheDevice:
+    """`cli live` must not undercut the measured profile.
+
+    VlmConfig.jetson() carries a MEASURED 12 s (5.1-9.1 s observed over 13
+    readings at MODE_30W). cli live passed its own default of 6 s straight into
+    VlmConfig.jetson(timeout_s=...), which silently overrode it -- and 6 s was
+    measured failing 8 of 8 readings. A flag default must not quietly contradict
+    the number the profile was measured into.
+    """
+
+    def test_live_default_is_not_below_the_measured_profile(self):
+        from .cli import main as _main   # noqa: F401  (ensures the module parses)
+        from .vlm_backends import VlmConfig
+        import argparse, ast, inspect, pathlib
+        src = pathlib.Path(inspect.getfile(VlmConfig)).parent / "cli.py"
+        tree = ast.parse(src.read_text())
+        found = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_argument"
+                    and node.args and getattr(node.args[0], "value", "") == "--monitor-timeout"):
+                for kw in node.keywords:
+                    if kw.arg == "default":
+                        found.append(ast.literal_eval(kw.value))
+        assert found, "no --monitor-timeout default found to check"
+        profile = VlmConfig.jetson().timeout_s
+        too_low = [d for d in found if d is not None and d < profile]
+        assert not too_low, (
+            f"--monitor-timeout defaults {too_low} are below the measured "
+            f"profile ({profile}s); 6s was measured failing every reading")

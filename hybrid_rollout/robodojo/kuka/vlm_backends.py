@@ -221,21 +221,36 @@ class VlmConfig:
     model: str = MONITOR_MODEL
     api_key_env: str = "LOCAL_VLM_API_KEY"
     timeout_s: float = 6.0
-    max_frames: int = 4               # t-1 and t, both cameras
+    max_frames: int = 2               # one camera's t-1/t pair; see jetson()
     temperature: float = 0.0
     health_path: str = "/v1/models"
 
     @classmethod
-    def jetson(cls, *, timeout_s: float = 6.0) -> "VlmConfig":
-        """The Jetson running Qwen3-VL-2B. Board model UNKNOWN.
+    def jetson(cls, *, timeout_s: float = 12.0) -> "VlmConfig":
+        """The Jetson running Qwen3-VL-2B (board recorded in JETSON_COMPUTE).
 
-        6 s is a STARTING POINT chosen to be honest rather than flattering: the
-        500M measured 3.05 s at MODE_30W, a 2B is larger, and a timeout that
-        fails every cycle teaches nothing. Measure on the device and tighten it.
-        The evidence cap (120 chars) already removed most of the decode cost,
-        which is where extra parameters hurt most.
+        12 s and a 2-frame pair come from MEASUREMENT on this device, replacing
+        the 6 s / 4-frame starting point. At MODE_30W (GPU 612 MHz, clocks
+        pinned via jetson_clocks; MAXN needs a reboot and was not taken):
+
+          4 frames, 6 s    8 of 8 readings TIMED OUT. Prefill alone is ~6 s --
+                           ~1950 prompt tokens at ~300 tok/s -- so generation
+                           had not begun when the client gave up.
+          2 frames, 12 s   13 of 13 readings completed over 3 episodes,
+                           5.1 s min / 6.7 s median / 9.1 s max.
+
+        WHERE THE TIME GOES, because it decides what to tune next: prefill is
+        ~1.7 s (750 tokens at ~450 tok/s) and generation is ~5.4-7.4 s (about
+        105 tokens at 15-19 tok/s). Generation dominates, so fewer frames buy
+        little further; a shorter response schema, a smaller quant or a higher
+        GPU clock are the levers that remain. JPEG frames do not help HERE --
+        the monitor is local, so payload size costs nothing on loopback; that
+        saving belongs to Astra, which is remote.
+
+        A pair is ONE camera at t-1 and t. Two cameras at one instant is not a
+        time sequence, and the CLI orders frames so truncation keeps the pair.
         """
-        return cls(model=MONITOR_MODEL, timeout_s=timeout_s, max_frames=4)
+        return cls(model=MONITOR_MODEL, timeout_s=timeout_s, max_frames=2)
 
     # Retained so existing callers keep working; both now mean the same thing.
     edge = jetson

@@ -14,3 +14,7 @@ pytest
 # Trajectory generation for the deployment path. Not optional: otg.py refuses to
 # substitute another profile, so without it the execution tests cannot run.
 ruckig
+# cameras.py imports cv2 lazily inside start(), so without this
+# `cli live --cameras` dies with a bare ModuleNotFoundError three
+# frames deep. Found on the Jetson.
+opencv-python-headless
