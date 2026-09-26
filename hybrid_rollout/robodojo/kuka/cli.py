@@ -395,8 +395,14 @@ def cmd_live(args: argparse.Namespace) -> int:
         api_key_env=args.astra_key_env, enabled=args.astra_live,
         dry_run=not args.astra_live, reasoning=args.astra_effort,
         background=args.astra_background, deadline_s=args.astra_deadline)
+    _ref = None
+    if getattr(args, "task_reference", None):
+        from .task_reference import load as _load_ref
+        _ref = _load_ref(args.task_reference)
+        print(f"  reference: {_ref.episode_id} ({len(_ref.phases)} phases), "
+              f"verified by {_ref.verified_by}")
     pipe = PolicyPipeline(resolve_mode(args.policy_mode), backend=backend,
-                          shadow=True,
+                          shadow=True, task_reference=_ref,
                           astra_review=(review.review if args.astra_live else None))
 
     # ---- RSI session ------------------------------------------------------
@@ -1041,6 +1047,11 @@ def main(argv=None) -> int:
     rn.add_argument("--monitor-gate", dest="monitor_shadow",
                     action="store_false",
                     help="LET THE MONITOR GATE. Off by default.")
+    rn.add_argument("--task-reference",
+                    help="JSON describing a VERIFIED successful episode "
+                         "for this task. Gives the intent gate an anchor. "
+                         "Off by default: upstream supplies no reference, so "
+                         "a run with one is not comparable to its numbers.")
     rn.add_argument("--astra-background", action="store_true", default=True,
                     help="submit and poll instead of holding one connection "
                          "(default on; the proxy cuts held connections at ~60s)")
@@ -1103,6 +1114,11 @@ def main(argv=None) -> int:
                     help="TRUE wall-clock bound across submit+poll")
     lv.add_argument("--model-interval", type=float, default=1.0,
                     help="minimum seconds between model cycles")
+    lv.add_argument("--task-reference",
+                    help="JSON describing a VERIFIED successful episode "
+                         "for this task. Gives the intent gate an anchor. "
+                         "Off by default: upstream supplies no reference, so "
+                         "a run with one is not comparable to its numbers.")
     lv.add_argument("--task", default="")
     lv.add_argument("--audit", default="live_observation.jsonl")
     lv.set_defaults(func=cmd_live)

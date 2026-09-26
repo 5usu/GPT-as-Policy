@@ -312,6 +312,7 @@ class PolicyPipeline:
                  shadow: bool = True,
                  astra_review: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
                  default_steps: int = 5,
+                 task_reference: Any = None,
                  on_record: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.mode = resolve_mode(mode)
         self.backend = backend or UnconfiguredBackend()
@@ -320,6 +321,11 @@ class PolicyPipeline:
         self.shadow = bool(shadow)
         self.astra_review = astra_review
         self.default_steps = max(1, min(default_steps, MAX_STUDENT_STEPS))
+        #: A verified successful episode, summarised. Gives the intent gate an
+        #: anchor instead of comparing Astra's expectation to its own guess.
+        #: None by default -- upstream supplies no reference, so a run WITH one
+        #: is not comparable to the published hybrid numbers.
+        self.task_reference = task_reference
         self.on_record = on_record
         self.cycle = 0
         self.controller = "pi05"
@@ -424,7 +430,7 @@ class PolicyPipeline:
                     observation_id=f"{episode_id or 'ep'}:c{self.cycle:06d}",
                     state=list(state), chunk=proposed_chunk or [list(state)],
                     provenance="model_predicted", frames=frames_meta or {},
-                    fk_preview=fk_preview)
+                    fk_preview=fk_preview, reference=self.task_reference)
                 pkt["escalation"] = {
                     "cause": decision.reason,
                     "monitor_reading": decision.reading,
@@ -531,6 +537,8 @@ class PolicyPipeline:
                 "mean": round(sum(lat) / len(lat), 4) if lat else None,
                 "max": round(max(lat), 4) if lat else None},
             "gate": self.gate.metrics(),
+            "task_reference": (self.task_reference.to_log()
+                               if self.task_reference is not None else None),
             # Events that occurred while the monitor was mid-inference. They
             # were delivered late, not dropped -- but a large number here means
             # the model is too slow for the motion it is watching.

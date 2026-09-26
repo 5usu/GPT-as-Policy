@@ -79,6 +79,7 @@ def build_packet(*, task_instruction: str, observation_id: str,
                  provenance: str, frames: dict[str, Any],
                  fk_preview: dict[str, Any] | None = None,
                  history: dict[str, Any] | None = None,
+                 reference: Any = None,
                  preview_steps: int = PREVIEW_STEPS) -> dict[str, Any]:
     """Assemble the review request. Returns a dict; sends nothing."""
     if provenance not in PROVENANCE_NOTE:
@@ -88,6 +89,12 @@ def build_packet(*, task_instruction: str, observation_id: str,
     head = rows[:preview_steps]
     lines = [
         PROVENANCE_NOTE[provenance], "",
+    ]
+    # Task context FIRST, before the proposal, so it reads as what the task is
+    # rather than as a comment on this chunk.
+    if reference is not None:
+        lines += [reference.render(), ""]
+    lines += [
         f"request_id: {observation_id}",
         f"task: {task_instruction}",
         f"current_joints_deg: {[round(v, 2) for v in list(state)[:ARM_DIM]]}",
@@ -121,5 +128,6 @@ def build_packet(*, task_instruction: str, observation_id: str,
         "frames": frames,
         "response_schema": response_schema(request_id=observation_id),
         "provenance": provenance,
+        "reference": reference.to_log() if reference is not None else None,
         "sends_nothing": True,
     }

@@ -1,0 +1,15 @@
+{
+  "_comment": "Template. Fill from a real episode that was CONFIRMED successful. 'rows' is summarised into phases and never forwarded to the reviewer.",
+  "task": "open the dishwasher door",
+  "episode_id": "F107_0917_open_ep0498",
+  "verified_successful": false,
+  "verified_by": "",
+  "subgoals": [
+    "move the gripper to the door handle",
+    "close the gripper on the handle",
+    "swing the door open",
+    "release the handle and retreat"
+  ],
+  "note": "state the object placement and anything that differed from a typical run",
+  "rows": []
+}
