@@ -1,0 +1,10 @@
+# The rig process: arms, cameras, gates, Qwen/Astra clients. No model runs here.
+# i2rt pins numpy==2.2.6 and ruckig==0.15.3 itself; install into Python 3.11.
+i2rt @ git+https://github.com/i2rt-robotics/i2rt@120c3c81400171174604e503943f8d1ebc891058
+opencv-python-headless
+scipy
+Pillow
+pytest
+# offline check of the pi0.5 server on the held-out recording (SETUP.md step 8)
+huggingface_hub
+pyarrow

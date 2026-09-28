@@ -1,0 +1,3 @@
+# Per-rig measured values and run outputs. Never committed.
+experiments/*/rig.local.toml
+runs/

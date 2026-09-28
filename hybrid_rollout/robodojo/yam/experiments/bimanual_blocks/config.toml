@@ -1,0 +1,82 @@
+# Bimanual YAM, block manipulation with robocurve/pi0.5-yam.
+#
+# EVERY EMPTY STRING BELOW IS DELIBERATE AND BLOCKING, exactly as in the KUKA
+# dishwasher config: these are quantities nobody has measured on this rig. TOML
+# has no null, so unset is written as "". `yam.safety.missing_config` refuses
+# arming until a human supplies each one. Filling one in is a claim that it was
+# measured or decided on the real rig.
+
+[task]
+name        = "bimanual_blocks"
+# Block manipulation is one of the checkpoint's trained task families (the
+# others are box packing and cable charging). The wording is the model card's
+# example; the policy is language-conditioned, so match the phrasing of the
+# MolmoAct2 training prompts where you can.
+instruction = "stack the blocks"
+robot_model = "I2RT YAM bimanual (2x 6-DoF + linear gripper)"
+control_hz  = 30.0
+contact_rich = true
+
+[checkpoint]
+repo_id        = "robocurve/pi0.5-yam"
+revision       = "ee17bb361e95eeba57853a2840480f5a1fc81a84"
+id             = "robocurve/pi0.5-yam@ee17bb36"
+framework      = "openpi (JAX/Orbax), EMA weights, step 10000"
+action_space   = "absolute_joint_targets_rad"
+action_names   = ["left_joint1", "left_joint2", "left_joint3", "left_joint4",
+                  "left_joint5", "left_joint6", "left_gripper",
+                  "right_joint1", "right_joint2", "right_joint3", "right_joint4",
+                  "right_joint5", "right_joint6", "right_gripper"]
+chunk_steps    = 16
+norm_asset_id  = "yam-bimanual-merged"
+norm_stats_sha256 = "16daf28cec63d4829f01d7858bfed079ad18e183ce826a268f66c6669f323863"
+cameras        = ["top", "left", "right"]
+
+# ------------------------------------------------------------------------ rig
+[rig]
+# identity -- operator facts
+robot_model = "I2RT YAM bimanual (2x 6-DoF + linear gripper)"
+rig_id    = ""   # REQUIRED: a name for THIS physical rig
+left_can  = ""   # REQUIRED: e.g. can_follower_l; check with `ip link`
+right_can = ""   # REQUIRED: e.g. can_follower_r
+# measured
+camera_mapping = ""        # REQUIRED: {"top": N, "left": N, "right": N}, confirmed by looking
+gripper_limits_left = ""   # REQUIRED: [closed, open] from a gripper calibration
+gripper_limits_right = ""  # REQUIRED: [closed, open] from a gripper calibration
+rest_pose = ""             # REQUIRED: 14 values the arms can go limp in
+table_workspace = ""       # REQUIRED: region both arms may occupy
+estop_tested = ""          # REQUIRED: reference to a completed E-stop test
+
+# --------------------------------------------------------------------- limits
+[limits]
+max_speed = ""              # REQUIRED: rad/s, for this task
+max_acceleration = ""       # REQUIRED: rad/s^2
+max_step_displacement = ""  # REQUIRED: rad per supervised step
+
+# ---------------------------------------------------------------- supervision
+[supervision]
+observation_freshness_s = ""  # REQUIRED
+heartbeat_timeout_s = ""      # REQUIRED
+success_predicate = ""        # REQUIRED: measurable, not model prose
+
+# --------------------------------------------------------------- stop / retry
+[stop_conditions]
+max_retries_per_subgoal = 2
+max_consecutive_no_progress = 3
+stop_on = [
+  "unexpected_contact_or_load",      # effort outside configured limits
+  "outside_workspace",               # an arm leaves table_workspace
+  "stale_vision",                    # observation older than freshness limit
+  "commanded_observed_disagreement", # measured motion != commanded motion
+  "heartbeat_lost",
+  "estop_engaged",
+]
+commanded_observed_tolerance_rad = ""   # REQUIRED: measured on the real rig
+
+# --------------------------------------------------------------- astra-direct
+[astra_direct]
+enabled              = false
+authorised_by        = ""  # REQUIRED
+bounded_action_space = ""  # REQUIRED
+dry_run_passed       = ""  # REQUIRED
+collision_model      = ""  # REQUIRED

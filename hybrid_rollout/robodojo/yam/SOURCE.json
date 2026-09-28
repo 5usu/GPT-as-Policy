@@ -1,0 +1,55 @@
+{
+  "schema": "hybrid_rollout.robodojo.yam.source.v1",
+  "status": "offline_only_no_robot_command_path_enabled",
+  "code_root": "hybrid_rollout/robodojo/yam",
+  "branch": "yam-local-vlm-gate",
+  "forked_from": {
+    "branch": "kuka-local-vlm-gate",
+    "commit": "4acf6d27c52919dd4502fa81a8827892c7168a05",
+    "relation": "same three-model architecture; robot-independent modules imported from hybrid_rollout/robodojo/kuka unchanged; no file outside hybrid_rollout/robodojo/yam is modified"
+  },
+  "upstream": {
+    "repo": "https://github.com/anonymous-report-421/GPT-as-Policy",
+    "commit": "8f3d362b077d8efb77e2a7274d5b2c20e2243846",
+    "reused_verbatim": ["robodojo_server/gate_assessment.py GATE_INSTRUCTION",
+                        "robodojo_server/kinematics.py ArmFK"],
+    "gate_prompt_unchanged": true
+  },
+  "policy": {
+    "repo_id": "robocurve/pi0.5-yam",
+    "revision": "ee17bb361e95eeba57853a2840480f5a1fc81a84",
+    "license": "gemma (PaliGemma backbone)",
+    "format": "openpi JAX/Orbax, EMA weights, step 10000",
+    "norm_stats": "assets/yam-bimanual-merged/norm_stats.json",
+    "norm_stats_sha256": "16daf28cec63d4829f01d7858bfed079ad18e183ce826a268f66c6669f323863",
+    "openpi_commit": "15a9616a00943ada6c20a0f158e3adb39df2ccac",
+    "training_data": "allenai/MolmoAct2-BimanualYAM-Dataset (Apache-2.0)",
+    "held_out_session": "allenai/19012026-block-13",
+    "published_validation": "open-loop MSE 0.00206 on the held-out session; no closed-loop or real-robot result",
+    "loader_note": "the card's yam_pi05 openpi config is registered by a private training repo; yam/pi05_serve.py reconstructs it from the published contract and must be checked with yam/make_chunks.py on the held-out session before use"
+  },
+  "contract_cross_checks": {
+    "vla-edge": "Agents2AgentsAI/vla-edge @ 747fd96aaf1a386d3873cf6c637e7a51141b66fd src/vla_edge/config.py PolicySpec pi05-bimanual-yam: 16x14 absolute, cameras top/left/right, closed_0_open_1, gripper_state=commanded",
+    "dataset": "allenai/19012026-block-13 meta/info.json: 14-value state/action left then right, cameras top/left/right 360x640 @ 30 fps, robot_type bi_yam_follower"
+  },
+  "robot": {
+    "model": "I2RT YAM bimanual, 2x (6 joints + linear-4310 gripper)",
+    "driver": "i2rt-robotics/i2rt @ 120c3c81400171174604e503943f8d1ebc891058 (MIT)",
+    "urdf": "robot_model/yam.urdf, copied unmodified from i2rt/robot_models/arm/yam/v1/yam.urdf",
+    "urdf_sha256": "c0967cf85c4904a142c3aa2bb7453af609354ee94997900040fd0b3e1b756bb8",
+    "tcp_transform": "UNKNOWN -- the urdf gripper link is a mount frame; eef disabled",
+    "arm_base_frames": "UNCALIBRATED -- per-arm FK only; eef disabled"
+  },
+  "unchanged_from_kuka_branch": [
+    "Qwen/Qwen3-VL-2B-Instruct local monitor on the Jetson (kuka/vlm_backends.py, kuka/vlm_monitor.py)",
+    "MonitorGate streaks, clamps, fail-safe and escalation policy",
+    "Astra client: gpt-6-astra over the Responses API, background submit+poll, no re-ask (kuka/transports.py)",
+    "safety primitives: modes, supervisor, freshness, signed single-step envelope, ledger (kuka/safety.py)",
+    "audit row, stages and outcomes (kuka/loop.py)"
+  ],
+  "execution_status": {
+    "real_motion_possible_by_default": false,
+    "hold_and_live": "connect to the arms read-only while i2rt holds position; no command method exists",
+    "gateway": "ShadowGateway only; no real gateway is wired"
+  }
+}
